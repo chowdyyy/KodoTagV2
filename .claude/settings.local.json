@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmd /c \"dir /s /b Source\")",
+      "Read(//c/Program Files/Epic Games/**)",
+      "Read(//c/Program Files/Epic Games/UE_5.7/Engine/Build/BatchFiles/**)"
+    ]
+  }
+}

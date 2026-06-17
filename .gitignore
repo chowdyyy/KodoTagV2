@@ -1,0 +1,20 @@
+# Unreal Engine generated / build artifacts — never commit these.
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+.vs/
+*.VC.db
+*.opensdf
+*.sdf
+*.sln
+*.suo
+*.xcodeproj/
+*.xcworkspace/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Keep: Source/, Content/, Config/, Tools/, *.uproject, README.md
