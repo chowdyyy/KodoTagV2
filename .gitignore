@@ -12,6 +12,10 @@ DerivedDataCache/
 *.xcodeproj/
 *.xcworkspace/
 
+# Packaged builds (the playable .exe output) — distribute via GitHub Releases, never commit.
+Releases/
+*.zip
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db

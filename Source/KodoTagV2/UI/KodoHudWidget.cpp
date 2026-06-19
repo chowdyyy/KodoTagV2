@@ -8,6 +8,7 @@
 #include "Actors/KodoWaveController.h"
 #include "Grid/KodoGridSubsystem.h"
 #include "Grid/KodoStructureManager.h"
+#include "Grid/KodoMapBootstrapper.h"
 #include "Data/KodoStructureData.h"
 #include "Core/KodoTagUnits.h"
 #include "Core/KodoTagGameState.h"
@@ -58,6 +59,21 @@ namespace
 		case ECellType::Tower:
 			return Cell.StructureId == FName("command_center") ? FColor::White : FColor(60, 200, 255);
 		default:                      return FColor(32, 58, 32);
+		}
+	}
+
+	/** Two-letter abbreviation for an inventory item (slot label). "-" when empty. */
+	const TCHAR* KodoItemAbbrev(const EKodoItem Item)
+	{
+		switch (Item)
+		{
+		case EKodoItem::BootsOfSpeed:     return TEXT("BS");
+		case EKodoItem::ClawsOfAttack:    return TEXT("CA");
+		case EKodoItem::RingOfProtection: return TEXT("RP");
+		case EKodoItem::PotionOfHealing:  return TEXT("HP");
+		case EKodoItem::PotionOfMana:     return TEXT("MP");
+		case EKodoItem::TomeOfExperience: return TEXT("XP");
+		default:                          return TEXT("-");
 		}
 	}
 }
@@ -120,8 +136,8 @@ void UKodoHudWidget::BuildTree()
 		}
 	}
 
-	// ===== BOTTOM BAR =====
-	UBorder* BottomBar = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass());
+	// ===== BOTTOM BAR ===== (stored as a member so edit mode can collapse it)
+	BottomBar = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass());
 	BottomBar->SetBrushColor(PanelDark);
 	BottomBar->SetPadding(FMargin(8.f));
 	if (UCanvasPanelSlot* BottomSlot = Root->AddChildToCanvas(BottomBar))
@@ -232,25 +248,138 @@ void UKodoHudWidget::BuildTree()
 		StatsSlot->SetPadding(FMargin(0.f, 2.f, 0.f, 4.f));
 	}
 
-	UHorizontalBox* InventoryBox = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
+	InventoryBox = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
 	InfoBox->AddChildToVerticalBox(InventoryBox);
 	InventorySlots.Reset();
+	InventoryLabels.Reset();
+	InventoryButtons.Reset();
+
 	for (int32 i = 0; i < 6; ++i)
 	{
 		USizeBox* SlotSize = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
 		SlotSize->SetWidthOverride(40.f);
 		SlotSize->SetHeightOverride(40.f);
+
+		// Border (backing) -> Overlay -> { label, click button } so the slot shows the item name and
+		// is clickable to use a consumable. The button sits on top, transparent, filling the slot.
 		UBorder* ItemSlot = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass());
 		ItemSlot->SetBrushColor(FLinearColor(0.16f, 0.13f, 0.08f));
 		ItemSlot->SetHorizontalAlignment(HAlign_Center);
 		ItemSlot->SetVerticalAlignment(VAlign_Center);
-		ItemSlot->SetContent(MakeText(FString::FromInt(i + 1), 11.f, FLinearColor(0.4f, 0.37f, 0.3f)));
+
+		UOverlay* SlotOverlay = WidgetTree->ConstructWidget<UOverlay>(UOverlay::StaticClass());
+
+		UTextBlock* SlotLabel = MakeText(TEXT("-"), 10.f, FLinearColor(0.85f, 0.8f, 0.6f));
+		SlotLabel->SetJustification(ETextJustify::Center);
+		if (UOverlaySlot* LblSlot = SlotOverlay->AddChildToOverlay(SlotLabel))
+		{
+			LblSlot->SetHorizontalAlignment(HAlign_Center);
+			LblSlot->SetVerticalAlignment(VAlign_Center);
+		}
+
+		UButton* SlotButton = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass());
+		SlotButton->SetBackgroundColor(FLinearColor(0.f, 0.f, 0.f, 0.f)); // transparent overlay click target
+		// AddDynamic stringizes its argument, so bind a literally-named UFUNCTION per slot index.
+		switch (i)
+		{
+		case 0: SlotButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnUseItem0); break;
+		case 1: SlotButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnUseItem1); break;
+		case 2: SlotButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnUseItem2); break;
+		case 3: SlotButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnUseItem3); break;
+		case 4: SlotButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnUseItem4); break;
+		case 5: SlotButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnUseItem5); break;
+		default: break;
+		}
+		if (UOverlaySlot* BtnSlot = SlotOverlay->AddChildToOverlay(SlotButton))
+		{
+			BtnSlot->SetHorizontalAlignment(HAlign_Fill);
+			BtnSlot->SetVerticalAlignment(VAlign_Fill);
+		}
+
+		ItemSlot->SetContent(SlotOverlay);
 		SlotSize->SetContent(ItemSlot);
 		if (UHorizontalBoxSlot* ItemBoxSlot = InventoryBox->AddChildToHorizontalBox(SlotSize))
 		{
 			ItemBoxSlot->SetPadding(FMargin(0.f, 0.f, 4.f, 0.f));
 		}
 		InventorySlots.Add(ItemSlot);
+		InventoryLabels.Add(SlotLabel);
+		InventoryButtons.Add(SlotButton);
+	}
+
+	// --- Center: production / research queue panel ---
+	// Fills the empty middle space. Shown only when the selected building is constructing or
+	// researching (driven each frame by UpdateProductionPanel): a header, then one row per active
+	// item — name, time elapsed/total, and a filling bar — so the whole queue is visible at a glance.
+	ProductionPanel = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass());
+	ProductionPanel->SetBrushColor(FLinearColor(0.10f, 0.08f, 0.04f, 0.96f)); // dark amber
+	ProductionPanel->SetPadding(FMargin(10.f, 6.f));
+	ProductionPanel->SetVerticalAlignment(VAlign_Center);
+	{
+		UVerticalBox* ProdColumn = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass());
+
+		ProdHeaderText = MakeText(TEXT("In Production"), 15.f, TextGold);
+		if (UVerticalBoxSlot* HSlot = ProdColumn->AddChildToVerticalBox(ProdHeaderText))
+		{
+			HSlot->SetPadding(FMargin(0.f, 0.f, 0.f, 5.f));
+		}
+
+		ProdRows.Reset();
+		ProdRowName.Reset();
+		ProdRowTime.Reset();
+		ProdRowBar.Reset();
+		for (int32 r = 0; r < 6; ++r)
+		{
+			UVerticalBox* Row = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass());
+
+			// Name (fill-left) + time (right).
+			UHorizontalBox* RowHead = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
+			UTextBlock* RName = MakeText(TEXT(""), 12.f, FLinearColor(0.95f, 0.9f, 0.78f));
+			RName->SetJustification(ETextJustify::Left);
+			if (UHorizontalBoxSlot* NSlot = RowHead->AddChildToHorizontalBox(RName))
+			{
+				NSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+				NSlot->SetHorizontalAlignment(HAlign_Left);
+				NSlot->SetVerticalAlignment(VAlign_Center);
+			}
+			UTextBlock* RTime = MakeText(TEXT(""), 11.f, FLinearColor(1.f, 0.82f, 0.3f));
+			RTime->SetJustification(ETextJustify::Right);
+			if (UHorizontalBoxSlot* TSlot = RowHead->AddChildToHorizontalBox(RTime))
+			{
+				TSlot->SetHorizontalAlignment(HAlign_Right);
+				TSlot->SetVerticalAlignment(VAlign_Center);
+			}
+			Row->AddChildToVerticalBox(RowHead);
+
+			// Thin filling bar.
+			USizeBox* BarSize = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
+			BarSize->SetHeightOverride(12.f);
+			UProgressBar* RBar = WidgetTree->ConstructWidget<UProgressBar>(UProgressBar::StaticClass());
+			RBar->SetFillColorAndOpacity(FLinearColor(1.f, 0.78f, 0.16f)); // amber fill
+			RBar->SetPercent(0.f);
+			BarSize->SetContent(RBar);
+			Row->AddChildToVerticalBox(BarSize);
+
+			Row->SetVisibility(ESlateVisibility::Collapsed);
+			if (UVerticalBoxSlot* RowSlot = ProdColumn->AddChildToVerticalBox(Row))
+			{
+				RowSlot->SetPadding(FMargin(0.f, 0.f, 0.f, 4.f));
+			}
+
+			ProdRows.Add(Row);
+			ProdRowName.Add(RName);
+			ProdRowTime.Add(RTime);
+			ProdRowBar.Add(RBar);
+		}
+
+		ProductionPanel->SetContent(ProdColumn);
+	}
+	ProductionPanel->SetVisibility(ESlateVisibility::Collapsed);
+	if (UHorizontalBoxSlot* ProdSlot = DetailsBox->AddChildToHorizontalBox(ProductionPanel))
+	{
+		ProdSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+		ProdSlot->SetPadding(FMargin(12.f, 0.f, 0.f, 0.f));
+		ProdSlot->SetVerticalAlignment(VAlign_Center);
 	}
 
 	// --- Right: 3x4 command card ---
@@ -274,6 +403,8 @@ void UKodoHudWidget::BuildTree()
 	CardActions.SetNum(12);
 	CardIsResearch.Init(false, 12);
 	CardResearchType.Init(EKodoResearch::Stun, 12);
+	CardBaseColor.Init(FLinearColor(0.22f, 0.17f, 0.09f), 12);
+	CardFlashTimer.Init(0.f, 12);
 	for (int32 i = 0; i < 12; ++i)
 	{
 		UButton* Button = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass());
@@ -304,6 +435,17 @@ void UKodoHudWidget::BuildTree()
 			LabelSlot->SetVerticalAlignment(VAlign_Center);
 		}
 
+		// Big centered cooldown countdown, drawn ON TOP of the label while an ability recharges
+		// (driven each frame by UpdateAbilityCooldowns). Collapsed when off cooldown.
+		UTextBlock* CdText = MakeText(TEXT(""), 22.f, FLinearColor(1.f, 0.95f, 0.4f));
+		CdText->SetJustification(ETextJustify::Center);
+		CdText->SetVisibility(ESlateVisibility::Collapsed);
+		if (UOverlaySlot* CdSlot = Cast<UOverlaySlot>(CardOverlay->AddChild(CdText)))
+		{
+			CdSlot->SetHorizontalAlignment(HAlign_Center);
+			CdSlot->SetVerticalAlignment(VAlign_Center);
+		}
+
 		Button->AddChild(CardOverlay);
 		if (UUniformGridSlot* GridSlot = CardGrid->AddChildToUniformGrid(Button, i / 4, i % 4))
 		{
@@ -329,6 +471,7 @@ void UKodoHudWidget::BuildTree()
 		CardButtons.Add(Button);
 		CardLabels.Add(Label);
 		CardProgress.Add(Progress);
+		CardCooldownText.Add(CdText);
 	}
 
 	// Minimap texture
@@ -348,6 +491,7 @@ void UKodoHudWidget::BuildTree()
 	BuildShopPanel(Root);
 	BuildEndOverlay(Root);
 	BuildStartOverlay(Root);
+	BuildEditorPalette(Root);
 }
 
 AKodoWaveController* UKodoHudWidget::ResolveWaveController() const
@@ -568,16 +712,85 @@ void UKodoHudWidget::BuildStartOverlay(UCanvasPanel* Root)
 	DiffInsaneButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnPickInsane);
 	if (UHorizontalBoxSlot* S = DiffRow->AddChildToHorizontalBox(DiffInsaneButton)) { S->SetPadding(FMargin(5.f)); }
 
-	// START button.
+	// Hero selection: "CHOOSE YOUR HERO" + a row of 6 buttons (name + melee/ranged tag).
+	UTextBlock* HeroTitle = MakeText(TEXT("CHOOSE YOUR HERO"), 18.f, TextGold);
+	HeroTitle->SetJustification(ETextJustify::Center);
+	if (UVerticalBoxSlot* HeroTitleSlot = Col->AddChildToVerticalBox(HeroTitle))
+	{
+		HeroTitleSlot->SetPadding(FMargin(0.f, 0.f, 0.f, 8.f));
+		HeroTitleSlot->SetHorizontalAlignment(HAlign_Center);
+	}
+
+	UHorizontalBox* HeroRow = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
+	if (UVerticalBoxSlot* HeroRowSlot = Col->AddChildToVerticalBox(HeroRow))
+	{
+		HeroRowSlot->SetHorizontalAlignment(HAlign_Center);
+		HeroRowSlot->SetPadding(FMargin(0.f, 0.f, 0.f, 24.f));
+	}
+
+	HeroButtons.Reset();
+	HeroChoices.Reset();
+	// Parallel: class enum, display name, and ranged flag (melee/ranged tag).
+	const EKodoHeroClass HeroEnums[6] = {
+		EKodoHeroClass::MountainKing, EKodoHeroClass::Blademaster, EKodoHeroClass::Archmage,
+		EKodoHeroClass::FarSeer, EKodoHeroClass::Paladin, EKodoHeroClass::Dreadlord };
+	const TCHAR* HeroNames[6] = {
+		TEXT("Mountain King"), TEXT("Blademaster"), TEXT("Archmage"),
+		TEXT("Far Seer"), TEXT("Paladin"), TEXT("Dreadlord") };
+	const bool HeroRanged[6] = { false, false, true, true, false, true };
+
+	for (int32 i = 0; i < 6; ++i)
+	{
+		HeroChoices.Add(HeroEnums[i]);
+
+		UButton* HeroBtn = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass());
+		const FString HeroLabelStr = FString::Printf(TEXT("%s\n(%s)"), HeroNames[i],
+		                                             HeroRanged[i] ? TEXT("ranged") : TEXT("melee"));
+		UTextBlock* HeroLbl = MakeText(HeroLabelStr, 14.f, FLinearColor::White);
+		HeroLbl->SetJustification(ETextJustify::Center);
+		HeroBtn->AddChild(HeroLbl);
+		switch (i)
+		{
+		case 0: HeroBtn->OnClicked.AddDynamic(this, &UKodoHudWidget::OnPickHero0); break;
+		case 1: HeroBtn->OnClicked.AddDynamic(this, &UKodoHudWidget::OnPickHero1); break;
+		case 2: HeroBtn->OnClicked.AddDynamic(this, &UKodoHudWidget::OnPickHero2); break;
+		case 3: HeroBtn->OnClicked.AddDynamic(this, &UKodoHudWidget::OnPickHero3); break;
+		case 4: HeroBtn->OnClicked.AddDynamic(this, &UKodoHudWidget::OnPickHero4); break;
+		case 5: HeroBtn->OnClicked.AddDynamic(this, &UKodoHudWidget::OnPickHero5); break;
+		default: break;
+		}
+		if (UHorizontalBoxSlot* S = HeroRow->AddChildToHorizontalBox(HeroBtn)) { S->SetPadding(FMargin(5.f)); }
+		HeroButtons.Add(HeroBtn);
+	}
+
+	// START + MAP EDITOR row.
+	UHorizontalBox* ActionRow = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
+	if (UVerticalBoxSlot* ActionRowSlot = Col->AddChildToVerticalBox(ActionRow))
+	{
+		ActionRowSlot->SetHorizontalAlignment(HAlign_Center);
+	}
+
 	UButton* Start = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass());
 	Start->SetBackgroundColor(FLinearColor(0.2f, 0.45f, 0.18f));
 	UTextBlock* StartLbl = MakeText(TEXT("   START   "), 24.f, FLinearColor::White);
 	StartLbl->SetJustification(ETextJustify::Center);
 	Start->AddChild(StartLbl);
 	Start->OnClicked.AddDynamic(this, &UKodoHudWidget::OnClickStart);
-	if (UVerticalBoxSlot* StartSlot = Col->AddChildToVerticalBox(Start))
+	if (UHorizontalBoxSlot* StartSlot = ActionRow->AddChildToHorizontalBox(Start))
 	{
-		StartSlot->SetHorizontalAlignment(HAlign_Center);
+		StartSlot->SetPadding(FMargin(8.f, 0.f, 8.f, 0.f));
+	}
+
+	EditMapButton = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass());
+	EditMapButton->SetBackgroundColor(FLinearColor(0.18f, 0.28f, 0.45f));
+	UTextBlock* EditLbl = MakeText(TEXT("  Map Editor  "), 18.f, FLinearColor::White);
+	EditLbl->SetJustification(ETextJustify::Center);
+	EditMapButton->AddChild(EditLbl);
+	EditMapButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnClickEditMap);
+	if (UHorizontalBoxSlot* EditSlot = ActionRow->AddChildToHorizontalBox(EditMapButton))
+	{
+		EditSlot->SetPadding(FMargin(8.f, 0.f, 8.f, 0.f));
+		EditSlot->SetVerticalAlignment(VAlign_Center);
 	}
 
 	RestyleStartButtons();
@@ -592,6 +805,13 @@ void UKodoHudWidget::RestyleStartButtons() const
 	if (DiffNormalButton) { DiffNormalButton->SetBackgroundColor(SelDiff == EKodoDifficulty::Normal ? SelectedBtn : UnselectedBtn); }
 	if (DiffHardButton)   { DiffHardButton->SetBackgroundColor(SelDiff == EKodoDifficulty::Hard ? SelectedBtn : UnselectedBtn); }
 	if (DiffInsaneButton) { DiffInsaneButton->SetBackgroundColor(SelDiff == EKodoDifficulty::Insane ? SelectedBtn : UnselectedBtn); }
+	for (int32 i = 0; i < HeroButtons.Num(); ++i)
+	{
+		if (HeroButtons[i] && HeroChoices.IsValidIndex(i))
+		{
+			HeroButtons[i]->SetBackgroundColor(SelHero == HeroChoices[i] ? SelectedBtn : UnselectedBtn);
+		}
+	}
 }
 
 void UKodoHudWidget::OnPickMaze()   { SelMode = EKodoGameMode::Maze; RestyleStartButtons(); }
@@ -602,8 +822,32 @@ void UKodoHudWidget::OnPickNormal() { SelDiff = EKodoDifficulty::Normal; Restyle
 void UKodoHudWidget::OnPickHard()   { SelDiff = EKodoDifficulty::Hard;   RestyleStartButtons(); }
 void UKodoHudWidget::OnPickInsane() { SelDiff = EKodoDifficulty::Insane; RestyleStartButtons(); }
 
+void UKodoHudWidget::OnPickHero0() { HandlePickHero(0); }
+void UKodoHudWidget::OnPickHero1() { HandlePickHero(1); }
+void UKodoHudWidget::OnPickHero2() { HandlePickHero(2); }
+void UKodoHudWidget::OnPickHero3() { HandlePickHero(3); }
+void UKodoHudWidget::OnPickHero4() { HandlePickHero(4); }
+void UKodoHudWidget::OnPickHero5() { HandlePickHero(5); }
+
+void UKodoHudWidget::HandlePickHero(const int32 Index)
+{
+	if (HeroChoices.IsValidIndex(Index))
+	{
+		SelHero = HeroChoices[Index];
+		RestyleStartButtons();
+	}
+}
+
 void UKodoHudWidget::OnClickStart()
 {
+	// Apply the chosen hero to the runner before the match starts.
+	if (AKodoPlayerController* PC = Controller.Get())
+	{
+		if (ARunnerCharacter* R = PC->GetRunner())
+		{
+			R->SetHeroClass(SelHero);
+		}
+	}
 	if (AKodoTagGameMode* GM = GetWorld()->GetAuthGameMode<AKodoTagGameMode>())
 	{
 		GM->BeginMatch(SelMode, SelDiff);
@@ -640,32 +884,388 @@ void UKodoHudWidget::BuildShopPanel(UCanvasPanel* Root)
 		TitleSlot->SetPadding(FMargin(0.f, 0.f, 0.f, 6.f));
 	}
 
-	BootsButton = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass());
-	BootsButton->SetBackgroundColor(FLinearColor(0.22f, 0.17f, 0.09f));
-	BootsLabel = MakeText(TEXT("Boots of Speed — 150g"), 14.f, FLinearColor::White);
-	BootsLabel->SetJustification(ETextJustify::Center);
-	BootsButton->AddChild(BootsLabel);
-	BootsButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnClickBuyBoots);
-	Col->AddChildToVerticalBox(BootsButton);
+	// One button per purchasable item (every EKodoItem except None). Labels + affordability are
+	// refreshed each frame in UpdateShopPanel; ShopItems[n] tells the handler which item slot n buys.
+	ShopButtons.Reset();
+	ShopLabels.Reset();
+	ShopItems.Reset();
+	ShopItems = {
+		EKodoItem::BootsOfSpeed,
+		EKodoItem::ClawsOfAttack,
+		EKodoItem::RingOfProtection,
+		EKodoItem::PotionOfHealing,
+		EKodoItem::PotionOfMana,
+		EKodoItem::TomeOfExperience
+	};
 
-	UTextBlock* Hint = MakeText(TEXT("+25% move speed"), 11.f, FLinearColor(0.7f, 0.7f, 0.65f));
-	Hint->SetJustification(ETextJustify::Center);
-	if (UVerticalBoxSlot* HintSlot = Col->AddChildToVerticalBox(Hint))
+	// AddDynamic stringizes its function-pointer argument, so each slot must bind a literally-named
+	// UFUNCTION (no loop variable) — switch on the index like the command-card buttons do.
+	for (int32 i = 0; i < ShopItems.Num(); ++i)
 	{
-		HintSlot->SetHorizontalAlignment(HAlign_Center);
-		HintSlot->SetPadding(FMargin(0.f, 4.f, 0.f, 0.f));
+		UButton* Btn = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass());
+		Btn->SetBackgroundColor(FLinearColor(0.22f, 0.17f, 0.09f));
+		UTextBlock* Lbl = MakeText(TEXT(""), 13.f, FLinearColor::White);
+		Lbl->SetJustification(ETextJustify::Center);
+		Btn->AddChild(Lbl);
+		switch (i)
+		{
+		case 0: Btn->OnClicked.AddDynamic(this, &UKodoHudWidget::OnBuyItem0); break;
+		case 1: Btn->OnClicked.AddDynamic(this, &UKodoHudWidget::OnBuyItem1); break;
+		case 2: Btn->OnClicked.AddDynamic(this, &UKodoHudWidget::OnBuyItem2); break;
+		case 3: Btn->OnClicked.AddDynamic(this, &UKodoHudWidget::OnBuyItem3); break;
+		case 4: Btn->OnClicked.AddDynamic(this, &UKodoHudWidget::OnBuyItem4); break;
+		case 5: Btn->OnClicked.AddDynamic(this, &UKodoHudWidget::OnBuyItem5); break;
+		default: break;
+		}
+		if (UVerticalBoxSlot* BtnSlot = Col->AddChildToVerticalBox(Btn))
+		{
+			BtnSlot->SetPadding(FMargin(0.f, 0.f, 0.f, 3.f));
+		}
+		ShopButtons.Add(Btn);
+		ShopLabels.Add(Lbl);
 	}
+
+	// Keep the legacy Boots refs pointing at slot 0 so older code/UI still resolves.
+	BootsButton = ShopButtons.Num() > 0 ? ShopButtons[0].Get() : nullptr;
+	BootsLabel = ShopLabels.Num() > 0 ? ShopLabels[0].Get() : nullptr;
 
 	ShopPanel->SetVisibility(ESlateVisibility::Collapsed);
 }
 
-void UKodoHudWidget::OnClickBuyBoots()
+void UKodoHudWidget::HandleBuyItem(const int32 Index)
+{
+	if (!ShopItems.IsValidIndex(Index))
+	{
+		return;
+	}
+	AKodoPlayerController* PC = Controller.Get();
+	if (ARunnerCharacter* Runner = PC ? PC->GetRunner() : nullptr)
+	{
+		Runner->BuyItem(ShopItems[Index]); // handles affordability/owned/full guards + spend
+	}
+}
+
+void UKodoHudWidget::OnClickBuyBoots() { HandleBuyItem(0); } // legacy entry -> Boots (slot 0)
+void UKodoHudWidget::OnBuyItem0() { HandleBuyItem(0); }
+void UKodoHudWidget::OnBuyItem1() { HandleBuyItem(1); }
+void UKodoHudWidget::OnBuyItem2() { HandleBuyItem(2); }
+void UKodoHudWidget::OnBuyItem3() { HandleBuyItem(3); }
+void UKodoHudWidget::OnBuyItem4() { HandleBuyItem(4); }
+void UKodoHudWidget::OnBuyItem5() { HandleBuyItem(5); }
+
+void UKodoHudWidget::HandleUseItem(const int32 Index)
 {
 	AKodoPlayerController* PC = Controller.Get();
 	if (ARunnerCharacter* Runner = PC ? PC->GetRunner() : nullptr)
 	{
-		Runner->BuyBoots(); // handles spend + already-owned guard; panel auto-hides next tick
+		Runner->UseInventorySlot(Index); // consumables apply + are removed; passives no-op
 	}
+}
+
+void UKodoHudWidget::OnUseItem0() { HandleUseItem(0); }
+void UKodoHudWidget::OnUseItem1() { HandleUseItem(1); }
+void UKodoHudWidget::OnUseItem2() { HandleUseItem(2); }
+void UKodoHudWidget::OnUseItem3() { HandleUseItem(3); }
+void UKodoHudWidget::OnUseItem4() { HandleUseItem(4); }
+void UKodoHudWidget::OnUseItem5() { HandleUseItem(5); }
+
+// =====================================================================================
+// In-world map editor palette (spatial editor pass).
+// =====================================================================================
+
+void UKodoHudWidget::BuildEditorPalette(UCanvasPanel* Root)
+{
+	// Left-edge vertical tool palette. Collapsed unless the controller IsEditMode()
+	// (toggled each frame by UpdateEditorPalette).
+	EditorPalette = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass(), TEXT("EditorPalette"));
+	EditorPalette->SetBrushColor(PanelDark);
+	EditorPalette->SetPadding(FMargin(8.f, 8.f));
+	if (UCanvasPanelSlot* PanelSlot = Root->AddChildToCanvas(EditorPalette))
+	{
+		PanelSlot->SetAnchors(FAnchors(0.f, 0.5f, 0.f, 0.5f));
+		PanelSlot->SetAlignment(FVector2D(0.f, 0.5f));
+		PanelSlot->SetPosition(FVector2D(8.f, 0.f));
+		PanelSlot->SetAutoSize(true);
+		PanelSlot->SetZOrder(80);
+	}
+
+	UVerticalBox* Col = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass());
+	EditorPalette->SetContent(Col);
+
+	UTextBlock* Title = MakeText(TEXT("MAP EDITOR"), 15.f, TextGold);
+	Title->SetJustification(ETextJustify::Center);
+	if (UVerticalBoxSlot* TitleSlot = Col->AddChildToVerticalBox(Title))
+	{
+		TitleSlot->SetHorizontalAlignment(HAlign_Center);
+		TitleSlot->SetPadding(FMargin(0.f, 0.f, 0.f, 2.f));
+	}
+
+	// Top hint line explaining the two mouse buttons.
+	UTextBlock* Hint = MakeText(TEXT("Left-click: paint   Right-click: erase"), 11.f, FLinearColor(0.7f, 0.7f, 0.65f));
+	Hint->SetJustification(ETextJustify::Center);
+	if (UVerticalBoxSlot* HintSlot = Col->AddChildToVerticalBox(Hint))
+	{
+		HintSlot->SetHorizontalAlignment(HAlign_Center);
+		HintSlot->SetPadding(FMargin(0.f, 0.f, 0.f, 6.f));
+	}
+
+	// Small section header label, e.g. "TERRAIN".
+	auto MakeSectionLabel = [this, Col](const TCHAR* Label)
+	{
+		UTextBlock* Lbl = MakeText(Label, 10.f, TextGold);
+		if (UVerticalBoxSlot* LblSlot = Col->AddChildToVerticalBox(Lbl))
+		{
+			LblSlot->SetPadding(FMargin(0.f, 7.f, 0.f, 1.f));
+			LblSlot->SetHorizontalAlignment(HAlign_Left);
+		}
+	};
+
+	// A full-width tool button. AddDynamic stringizes its function-pointer argument, so each
+	// binding must name its UFUNCTION literally (no loop variable) — done at the call sites below.
+	auto MakeToolButton = [this, Col](const TCHAR* Label) -> UButton*
+	{
+		UButton* Btn = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass());
+		Btn->SetBackgroundColor(FLinearColor(0.22f, 0.17f, 0.09f));
+		UTextBlock* Lbl = MakeText(Label, 13.f, TextPale);
+		Lbl->SetJustification(ETextJustify::Center);
+		Btn->AddChild(Lbl);
+		if (UVerticalBoxSlot* BtnSlot = Col->AddChildToVerticalBox(Btn))
+		{
+			BtnSlot->SetPadding(FMargin(0.f, 2.f, 0.f, 0.f));
+			BtnSlot->SetHorizontalAlignment(HAlign_Fill);
+		}
+		return Btn;
+	};
+
+	// --- NAVIGATE --- (Pan: move around the map without placing anything)
+	MakeSectionLabel(TEXT("NAVIGATE"));
+	ToolPanButton = MakeToolButton(TEXT("Pan (no paint)"));
+	ToolPanButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnEditPan);
+
+	// --- TERRAIN ---
+	MakeSectionLabel(TEXT("TERRAIN"));
+	ToolRidgeButton = MakeToolButton(TEXT("Ridge"));
+	ToolRidgeButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnEditRidge);
+	ToolTreeButton = MakeToolButton(TEXT("Tree"));
+	ToolTreeButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnEditTree);
+	ToolMineButton = MakeToolButton(TEXT("Gold Mine"));
+	ToolMineButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnEditMine);
+	ToolEraseButton = MakeToolButton(TEXT("Erase"));
+	ToolEraseButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnEditErase);
+
+	// --- SPAWNS ---
+	MakeSectionLabel(TEXT("SPAWNS"));
+	ToolKodoSpawnButton = MakeToolButton(TEXT("Kodo"));
+	ToolKodoSpawnButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnEditKodoSpawn);
+	ToolRunnerSpawnButton = MakeToolButton(TEXT("Runner"));
+	ToolRunnerSpawnButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnEditRunnerSpawn);
+	ToolMerchantButton = MakeToolButton(TEXT("Merchant"));
+	ToolMerchantButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnEditMerchant);
+
+	// --- ELEVATION ---
+	MakeSectionLabel(TEXT("ELEVATION"));
+	ToolRaiseButton = MakeToolButton(TEXT("Raise"));
+	ToolRaiseButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnEditRaise);
+	ToolLowerButton = MakeToolButton(TEXT("Lower"));
+	ToolLowerButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnEditLower);
+
+	// --- RAMP ---
+	MakeSectionLabel(TEXT("RAMP"));
+	ToolRampButton = MakeToolButton(TEXT("Ramp"));
+	ToolRampButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnEditRamp);
+
+	// Ramp direction row: N E S W.
+	UHorizontalBox* RampRow = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
+	if (UVerticalBoxSlot* RampRowSlot = Col->AddChildToVerticalBox(RampRow))
+	{
+		RampRowSlot->SetPadding(FMargin(0.f, 2.f, 0.f, 0.f));
+		RampRowSlot->SetHorizontalAlignment(HAlign_Center);
+	}
+	auto MakeDirButton = [this, RampRow](const TCHAR* Label) -> UButton*
+	{
+		UButton* Btn = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass());
+		Btn->SetBackgroundColor(FLinearColor(0.16f, 0.13f, 0.08f));
+		UTextBlock* Lbl = MakeText(Label, 12.f, TextPale);
+		Lbl->SetJustification(ETextJustify::Center);
+		Btn->AddChild(Lbl);
+		if (UHorizontalBoxSlot* BtnSlot = RampRow->AddChildToHorizontalBox(Btn))
+		{
+			BtnSlot->SetPadding(FMargin(1.f, 0.f, 1.f, 0.f));
+		}
+		return Btn;
+	};
+	RampNButton = MakeDirButton(TEXT(" N "));
+	RampNButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnEditRampN);
+	RampEButton = MakeDirButton(TEXT(" E "));
+	RampEButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnEditRampE);
+	RampSButton = MakeDirButton(TEXT(" S "));
+	RampSButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnEditRampS);
+	RampWButton = MakeDirButton(TEXT(" W "));
+	RampWButton->OnClicked.AddDynamic(this, &UKodoHudWidget::OnEditRampW);
+
+	// --- FILE ---
+	MakeSectionLabel(TEXT("FILE"));
+	// Save + Done row.
+	UHorizontalBox* SaveRow = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass());
+	if (UVerticalBoxSlot* SaveRowSlot = Col->AddChildToVerticalBox(SaveRow))
+	{
+		SaveRowSlot->SetPadding(FMargin(0.f, 2.f, 0.f, 0.f));
+		SaveRowSlot->SetHorizontalAlignment(HAlign_Center);
+	}
+
+	UButton* SaveBtn = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass());
+	SaveBtn->SetBackgroundColor(FLinearColor(0.2f, 0.4f, 0.15f));
+	UTextBlock* SaveLbl = MakeText(TEXT(" Save "), 14.f, FLinearColor::White);
+	SaveLbl->SetJustification(ETextJustify::Center);
+	SaveBtn->AddChild(SaveLbl);
+	SaveBtn->OnClicked.AddDynamic(this, &UKodoHudWidget::OnEditSave);
+	if (UHorizontalBoxSlot* S = SaveRow->AddChildToHorizontalBox(SaveBtn)) { S->SetPadding(FMargin(2.f, 0.f, 2.f, 0.f)); }
+
+	UButton* PlayBtn = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass());
+	PlayBtn->SetBackgroundColor(FLinearColor(0.18f, 0.28f, 0.45f));
+	UTextBlock* PlayLbl = MakeText(TEXT(" Done - to Menu "), 14.f, FLinearColor::White);
+	PlayLbl->SetJustification(ETextJustify::Center);
+	PlayBtn->AddChild(PlayLbl);
+	PlayBtn->OnClicked.AddDynamic(this, &UKodoHudWidget::OnEditPlay);
+	if (UHorizontalBoxSlot* S = SaveRow->AddChildToHorizontalBox(PlayBtn)) { S->SetPadding(FMargin(2.f, 0.f, 2.f, 0.f)); }
+
+	// Feedback line ("Map saved").
+	EditorMsgText = MakeText(TEXT(""), 12.f, FLinearColor(0.3f, 0.9f, 0.4f));
+	EditorMsgText->SetJustification(ETextJustify::Center);
+	if (UVerticalBoxSlot* MsgSlot = Col->AddChildToVerticalBox(EditorMsgText))
+	{
+		MsgSlot->SetPadding(FMargin(0.f, 6.f, 0.f, 0.f));
+		MsgSlot->SetHorizontalAlignment(HAlign_Center);
+	}
+
+	EditorPalette->SetVisibility(ESlateVisibility::Collapsed);
+}
+
+void UKodoHudWidget::OnClickEditMap()
+{
+	if (AKodoPlayerController* PC = Controller.Get())
+	{
+		PC->EnterEditMode();
+	}
+	if (StartOverlay)
+	{
+		StartOverlay->SetVisibility(ESlateVisibility::Collapsed);
+	}
+	// The editor palette becomes visible via UpdateEditorPalette (IsEditMode check).
+}
+
+void UKodoHudWidget::OnEditPan()         { if (AKodoPlayerController* PC = Controller.Get()) { PC->SetEditTool(EEditTool::None); } }
+void UKodoHudWidget::OnEditRidge()       { if (AKodoPlayerController* PC = Controller.Get()) { PC->SetEditTool(EEditTool::Ridge); } }
+void UKodoHudWidget::OnEditTree()        { if (AKodoPlayerController* PC = Controller.Get()) { PC->SetEditTool(EEditTool::Tree); } }
+void UKodoHudWidget::OnEditMine()        { if (AKodoPlayerController* PC = Controller.Get()) { PC->SetEditTool(EEditTool::Mine); } }
+void UKodoHudWidget::OnEditErase()       { if (AKodoPlayerController* PC = Controller.Get()) { PC->SetEditTool(EEditTool::Erase); } }
+void UKodoHudWidget::OnEditKodoSpawn()   { if (AKodoPlayerController* PC = Controller.Get()) { PC->SetEditTool(EEditTool::KodoSpawn); } }
+void UKodoHudWidget::OnEditRunnerSpawn() { if (AKodoPlayerController* PC = Controller.Get()) { PC->SetEditTool(EEditTool::RunnerSpawn); } }
+void UKodoHudWidget::OnEditMerchant()    { if (AKodoPlayerController* PC = Controller.Get()) { PC->SetEditTool(EEditTool::Merchant); } }
+void UKodoHudWidget::OnEditRaise()       { if (AKodoPlayerController* PC = Controller.Get()) { PC->SetEditTool(EEditTool::ElevRaise); } }
+void UKodoHudWidget::OnEditLower()       { if (AKodoPlayerController* PC = Controller.Get()) { PC->SetEditTool(EEditTool::ElevLower); } }
+void UKodoHudWidget::OnEditRamp()        { if (AKodoPlayerController* PC = Controller.Get()) { PC->SetEditTool(EEditTool::Ramp); } }
+void UKodoHudWidget::OnEditRampN()       { if (AKodoPlayerController* PC = Controller.Get()) { PC->SetEditTool(EEditTool::Ramp, 3); } }
+void UKodoHudWidget::OnEditRampE()       { if (AKodoPlayerController* PC = Controller.Get()) { PC->SetEditTool(EEditTool::Ramp, 0); } }
+void UKodoHudWidget::OnEditRampS()       { if (AKodoPlayerController* PC = Controller.Get()) { PC->SetEditTool(EEditTool::Ramp, 2); } }
+void UKodoHudWidget::OnEditRampW()       { if (AKodoPlayerController* PC = Controller.Get()) { PC->SetEditTool(EEditTool::Ramp, 1); } }
+
+void UKodoHudWidget::OnEditSave()
+{
+	AKodoPlayerController* PC = Controller.Get();
+	UKodoGridSubsystem* Grid = GetWorld() ? GetWorld()->GetSubsystem<UKodoGridSubsystem>() : nullptr;
+	bool bSaved = false;
+	if (PC && Grid)
+	{
+		if (AKodoMapBootstrapper* Boot = PC->GetBootstrapper())
+		{
+			bSaved = Boot->SaveLayoutToFile(*Grid);
+		}
+	}
+	if (EditorMsgText)
+	{
+		EditorMsgText->SetText(FText::FromString(bSaved ? TEXT("Map saved") : TEXT("Save failed")));
+		EditorMsgText->SetColorAndOpacity(FSlateColor(bSaved ? FLinearColor(0.3f, 0.9f, 0.4f) : FLinearColor(1.f, 0.3f, 0.2f)));
+		EditorMsgTimer = 3.f;
+	}
+}
+
+void UKodoHudWidget::OnEditPlay()
+{
+	if (AKodoPlayerController* PC = Controller.Get())
+	{
+		PC->ExitEditMode();
+	}
+	// Return to the start overlay so the player picks mode/difficulty and presses Start;
+	// the edited map is already live in the grid, so the match just uses it.
+	if (StartOverlay)
+	{
+		StartOverlay->SetVisibility(ESlateVisibility::Visible);
+	}
+	// Editor palette hides next tick via UpdateEditorPalette (IsEditMode is now false).
+}
+
+void UKodoHudWidget::UpdateEditorPalette() const
+{
+	if (!EditorPalette)
+	{
+		return;
+	}
+	const AKodoPlayerController* PC = Controller.Get();
+	const bool bEdit = PC && PC->IsEditMode();
+	EditorPalette->SetVisibility(bEdit ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+	if (!bEdit)
+	{
+		return;
+	}
+
+	// Active-tool highlight: the selected tool's button gets an accent green, the rest stay neutral
+	// (mirrors RestyleStartButtons). Ramp-direction buttons highlight the active direction.
+	const FLinearColor ToolAccent(0.27f, 0.4f, 0.18f);   // selected
+	const FLinearColor ToolNeutral(0.22f, 0.17f, 0.09f); // unselected (matches MakeToolButton default)
+	const FLinearColor DirAccent(0.27f, 0.4f, 0.18f);
+	const FLinearColor DirNeutral(0.16f, 0.13f, 0.08f);  // matches MakeDirButton default
+
+	const EEditTool Active = PC->GetActiveEditTool();
+	auto Style = [&](UButton* Btn, EEditTool Tool)
+	{
+		if (Btn) { Btn->SetBackgroundColor(Active == Tool ? ToolAccent : ToolNeutral); }
+	};
+	Style(ToolPanButton, EEditTool::None);
+	Style(ToolRidgeButton, EEditTool::Ridge);
+	Style(ToolTreeButton, EEditTool::Tree);
+	Style(ToolMineButton, EEditTool::Mine);
+	Style(ToolEraseButton, EEditTool::Erase);
+	Style(ToolKodoSpawnButton, EEditTool::KodoSpawn);
+	Style(ToolRunnerSpawnButton, EEditTool::RunnerSpawn);
+	Style(ToolMerchantButton, EEditTool::Merchant);
+	Style(ToolRaiseButton, EEditTool::ElevRaise);
+	Style(ToolLowerButton, EEditTool::ElevLower);
+	Style(ToolRampButton, EEditTool::Ramp);
+
+	// Ramp direction: only emphasize when the Ramp tool is active. Dir codes: 0=E,1=W,2=S,3=N.
+	const bool bRamp = Active == EEditTool::Ramp;
+	const int32 Dir = PC->GetEditRampDir();
+	auto StyleDir = [&](UButton* Btn, int32 D)
+	{
+		if (Btn) { Btn->SetBackgroundColor((bRamp && Dir == D) ? DirAccent : DirNeutral); }
+	};
+	StyleDir(RampNButton, 3);
+	StyleDir(RampEButton, 0);
+	StyleDir(RampSButton, 2);
+	StyleDir(RampWButton, 1);
+}
+
+void UKodoHudWidget::UpdateEditorChrome() const
+{
+	if (!BottomBar)
+	{
+		return;
+	}
+	const AKodoPlayerController* PC = Controller.Get();
+	const bool bEdit = PC && PC->IsEditMode();
+	// Hide the gameplay command/details/minimap bar while sculpting the map; restore it on exit.
+	BottomBar->SetVisibility(bEdit ? ESlateVisibility::Collapsed : ESlateVisibility::Visible);
 }
 
 void UKodoHudWidget::BuildEndOverlay(UCanvasPanel* Root)
@@ -698,6 +1298,25 @@ void UKodoHudWidget::UpdateCardProgress() const
 	AKodoPlayerController* PC = Controller.Get();
 	const AKodoStructureManager* Manager = PC ? PC->GetStructureManager() : nullptr;
 
+	// War-Altar hero-stat upgrades are TIMED + queued on the hero (not in the structure manager's
+	// research list). When the selected building is the war_altar, drive cards 0..4 from the hero's
+	// per-stat upgrade progress (front item fills live; queued shows 0). Cards map 1:1 to the war_altar
+	// stat-button order: 0=Damage 1=Armor 2=AttackSpeed 3=ManaRegen 4=MaxHealth.
+	ARunnerCharacter* WarAltarRunner = nullptr;
+	if (PC && PC->GetSelectionKind() == EKodoSelection::Cell)
+	{
+		const UKodoGridSubsystem* Grid = GetWorld() ? GetWorld()->GetSubsystem<UKodoGridSubsystem>() : nullptr;
+		const FGridCell Cell = Grid ? Grid->GetCell(PC->GetSelectedCell()) : FGridCell();
+		if (Cell.StructureId == FName("war_altar"))
+		{
+			WarAltarRunner = PC->GetRunner();
+		}
+	}
+	static const EKodoHeroStat StatForCard[5] = {
+		EKodoHeroStat::Damage, EKodoHeroStat::Armor, EKodoHeroStat::AttackSpeed,
+		EKodoHeroStat::ManaRegen, EKodoHeroStat::MaxHealth
+	};
+
 	for (int32 i = 0; i < CardButtons.Num(); ++i)
 	{
 		if (!CardProgress.IsValidIndex(i) || !CardProgress[i])
@@ -706,7 +1325,15 @@ void UKodoHudWidget::UpdateCardProgress() const
 		}
 
 		float Frac = -1.f;
-		if (Manager && CardIsResearch.IsValidIndex(i) && CardIsResearch[i] && CardResearchType.IsValidIndex(i))
+		if (WarAltarRunner && i >= 0 && i < 5)
+		{
+			float StatFrac = 0.f, StatRem = 0.f;
+			if (WarAltarRunner->GetStatUpgradeProgress(StatForCard[i], StatFrac, StatRem))
+			{
+				Frac = StatFrac; // front item: live fill; queued-but-not-started: 0
+			}
+		}
+		else if (Manager && CardIsResearch.IsValidIndex(i) && CardIsResearch[i] && CardResearchType.IsValidIndex(i))
 		{
 			float Remaining = 0.f;
 			Frac = Manager->GetResearchProgress(CardResearchType[i], Remaining);
@@ -724,6 +1351,199 @@ void UKodoHudWidget::UpdateCardProgress() const
 	}
 }
 
+void UKodoHudWidget::FlashCardButton(const int32 SlotIndex)
+{
+	// Brief, clearly-visible keypress/click highlight on a command-card slot (consumed by the per-frame
+	// flash pass in UpdateAbilityCooldowns). ~0.25s so the bright tint registers on a quick keypress.
+	if (CardFlashTimer.IsValidIndex(SlotIndex))
+	{
+		CardFlashTimer[SlotIndex] = 0.25f;
+	}
+}
+
+void UKodoHudWidget::OpenBuildSubmenuFlash(const int32 CardIndex)
+{
+	// Build-hotkey (W/C/T) feedback: switch the runner command card to the build submenu, clear the
+	// cached context key so RebuildCommandCardIfNeeded rebuilds to the submenu next frame, then flash
+	// the matching submenu card so the menu visibly reacts exactly like a button click would.
+	bBuildSubmenu = true;
+	CurrentContextKey.Empty();
+	FlashCardButton(CardIndex);
+}
+
+void UKodoHudWidget::UpdateAbilityCooldowns() const
+{
+	// Overlay a live countdown on the hero's active-ability buttons (cards 0/1/3) while they recharge,
+	// and drive their per-frame tint (armed > flash > on-cooldown-gray > base color).
+	//
+	// FIXED GATE: the runner ability card is the DEFAULT card whenever selection != Cell (RebuildCommand-
+	// CardIfNeeded's `else` branch), so it shows for BOTH Runner and None selections — not only Runner.
+	AKodoPlayerController* PC = Controller.Get();
+	ARunnerCharacter* R = PC ? PC->GetRunner() : nullptr;
+	const bool bRunnerCard = PC && R && !bBuildSubmenu && !PC->IsEditMode() &&
+	                         PC->GetSelectionKind() != EKodoSelection::Cell;
+
+	const float Delta = GetWorld() ? GetWorld()->GetDeltaSeconds() : 0.f;
+	const int32 PendingSlot = PC ? PC->GetPendingCastSlot() : -1;
+
+	// Highlight palettes.
+	const FLinearColor ArmedTint(0.25f, 0.85f, 0.95f);  // steady cyan — awaiting target
+	const FLinearColor FlashTint(0.9f, 0.85f, 0.45f);   // bright — keypress/click flash
+	const FLinearColor CooldownGray(0.12f, 0.12f, 0.12f);
+
+	for (int32 i = 0; i < CardCooldownText.Num(); ++i)
+	{
+		UTextBlock* Cd = CardCooldownText[i];
+		if (!Cd) { continue; }
+
+		// Active ability slots map 1:1 to cards 0/1/3 (card 2 is the passive; 4/5 are Attack/Build).
+		const bool bAbilityCard = (i == 0 || i == 1 || i == 3);
+
+		// Decay the flash timer every frame regardless of context (guarded).
+		if (CardFlashTimer.IsValidIndex(i) && CardFlashTimer[i] > 0.f)
+		{
+			CardFlashTimer[i] = FMath::Max(0.f, CardFlashTimer[i] - Delta);
+		}
+
+		float Remaining = 0.f;
+		if (bRunnerCard && bAbilityCard) { Remaining = R->GetSkillCooldownRemaining(i); }
+		const bool bOnCooldown = Remaining > 0.05f;
+
+		if (bOnCooldown)
+		{
+			Cd->SetText(FText::FromString(FString::Printf(TEXT("%.0f"), FMath::CeilToFloat(Remaining))));
+			Cd->SetVisibility(ESlateVisibility::HitTestInvisible);
+			// Also drive the slot's bar as a "recharge" fill (fills up as the ability becomes ready).
+			if (CardProgress.IsValidIndex(i) && CardProgress[i])
+			{
+				const float Total = R->GetAbilityCooldown(i);
+				const float Frac = (Total > 0.f) ? (1.f - Remaining / Total) : 0.f;
+				CardProgress[i]->SetVisibility(ESlateVisibility::Visible);
+				CardProgress[i]->SetPercent(FMath::Clamp(Frac, 0.f, 1.f));
+			}
+		}
+		else
+		{
+			Cd->SetVisibility(ESlateVisibility::Collapsed);
+		}
+
+		if (!CardButtons.IsValidIndex(i) || !CardButtons[i])
+		{
+			continue;
+		}
+
+		const bool bFlashing = CardFlashTimer.IsValidIndex(i) && CardFlashTimer[i] > 0.f;
+
+		// Per-frame button tint for the runner ability cards (0/1/3): armed > flash > cooldown gray > base.
+		if (bRunnerCard && bAbilityCard)
+		{
+			const bool bArmed = (PendingSlot == i);
+			const FLinearColor Base = CardBaseColor.IsValidIndex(i) ? CardBaseColor[i] : FLinearColor(0.30f, 0.40f, 0.28f);
+
+			FLinearColor Tint;
+			if (bArmed)         { Tint = ArmedTint; }
+			else if (bFlashing) { Tint = FlashTint; }
+			else if (bOnCooldown){ Tint = CooldownGray; }
+			else                { Tint = Base; }
+
+			CardButtons[i]->SetBackgroundColor(Tint);
+			continue;
+		}
+
+		// Any OTHER visible card (e.g. the BUILD submenu cards): only TOUCH the color while it's
+		// flashing — override to the bright flash tint, then let SetCardButton's base color (restored
+		// on the next rebuild) take back over once the flash decays. This keeps research/cooldown
+		// coloring untouched (gated on bFlashing) while making W/C/T visibly react on the build menu.
+		if (bFlashing && CardButtons[i]->GetVisibility() == ESlateVisibility::Visible)
+		{
+			CardButtons[i]->SetBackgroundColor(FlashTint);
+		}
+		else if (CardFlashTimer.IsValidIndex(i) && CardFlashTimer[i] <= 0.f &&
+		         CardBaseColor.IsValidIndex(i) && CardButtons[i]->GetVisibility() == ESlateVisibility::Visible)
+		{
+			// Flash just ended on a non-ability card: restore its normal color (a non-research card
+			// won't otherwise rebuild every frame, so without this the bright tint would linger).
+			CardButtons[i]->SetBackgroundColor(CardBaseColor[i]);
+		}
+	}
+}
+
+void UKodoHudWidget::UpdateProductionPanel() const
+{
+	// Center-of-bar production readout: when the selected building is constructing, researching, or
+	// upgrading, list every active item — name, elapsed/total time, and a filling bar — so the whole
+	// queue is visible at a glance. Purely selection + manager state (no hero proximity).
+	if (!ProductionPanel)
+	{
+		return;
+	}
+
+	struct FProdEntry { FString Name; float Frac; float Rem; float Total; };
+	TArray<FProdEntry> Actives;
+
+	AKodoPlayerController* PC = Controller.Get();
+	AKodoStructureManager* Mgr = PC ? PC->GetStructureManager() : nullptr;
+	if (PC && Mgr && !PC->IsEditMode())
+	{
+		// A) Construction: a selected cell that is currently being built.
+		if (PC->GetSelectionKind() == EKodoSelection::Cell)
+		{
+			float Frac = 0.f, Rem = 0.f, Total = 0.f;
+			if (Mgr->GetConstructionProgress(PC->GetSelectedCell(), Frac, Rem, Total))
+			{
+				Actives.Add({ TEXT("Under construction"), Frac, Rem, Total });
+			}
+		}
+
+		// B) Research / upgrade: every active item among the selected building's flagged slots.
+		TArray<EKodoResearch> Relevant;
+		for (int32 i = 0; i < CardIsResearch.Num(); ++i)
+		{
+			if (CardIsResearch[i] && CardResearchType.IsValidIndex(i))
+			{
+				Relevant.AddUnique(CardResearchType[i]); // dedup
+			}
+		}
+		for (const EKodoResearch Type : Relevant)
+		{
+			FString Name;
+			float Frac = 0.f, Rem = 0.f, Total = 0.f;
+			if (Mgr->GetResearchStatus(Type, Name, Frac, Rem, Total))
+			{
+				Actives.Add({ Name, Frac, Rem, Total });
+			}
+		}
+	}
+
+	if (Actives.Num() == 0)
+	{
+		ProductionPanel->SetVisibility(ESlateVisibility::Collapsed);
+		return;
+	}
+
+	// Soonest-to-finish first (all run in parallel, so this orders the queue by completion).
+	Actives.Sort([](const FProdEntry& A, const FProdEntry& B) { return A.Rem < B.Rem; });
+
+	for (int32 r = 0; r < ProdRows.Num(); ++r)
+	{
+		if (!ProdRows[r]) { continue; }
+		if (r < Actives.Num())
+		{
+			const FProdEntry& E = Actives[r];
+			if (ProdRowName.IsValidIndex(r) && ProdRowName[r]) { ProdRowName[r]->SetText(FText::FromString(E.Name)); }
+			if (ProdRowTime.IsValidIndex(r) && ProdRowTime[r]) { ProdRowTime[r]->SetText(FText::FromString(FString::Printf(TEXT("%.0f / %.0fs"), E.Total - E.Rem, E.Total))); }
+			if (ProdRowBar.IsValidIndex(r) && ProdRowBar[r])   { ProdRowBar[r]->SetPercent(FMath::Clamp(E.Frac, 0.f, 1.f)); }
+			ProdRows[r]->SetVisibility(ESlateVisibility::HitTestInvisible);
+		}
+		else
+		{
+			ProdRows[r]->SetVisibility(ESlateVisibility::Collapsed);
+		}
+	}
+
+	ProductionPanel->SetVisibility(ESlateVisibility::Visible);
+}
+
 // =====================================================================================
 // Gameplay layer: per-frame update helpers.
 // =====================================================================================
@@ -732,6 +1552,14 @@ void UKodoHudWidget::UpdateStartOverlay() const
 {
 	if (!StartOverlay)
 	{
+		return;
+	}
+	// While painting in the editor the start overlay stays hidden (the editor palette owns the
+	// screen); Play re-shows it. Otherwise it follows the match-started flag.
+	const AKodoPlayerController* PC = Controller.Get();
+	if (PC && PC->IsEditMode())
+	{
+		StartOverlay->SetVisibility(ESlateVisibility::Collapsed);
 		return;
 	}
 	const AKodoTagGameState* GS = GetWorld()->GetGameState<AKodoTagGameState>();
@@ -808,8 +1636,10 @@ void UKodoHudWidget::UpdateShopPanel() const
 	ARunnerCharacter* Runner = PC ? PC->GetRunner() : nullptr;
 	const UKodoGridSubsystem* Grid = GetWorld()->GetSubsystem<UKodoGridSubsystem>();
 
+	// Show the shop whenever the match is running and the runner stands near the merchant — there are
+	// multiple items now, so we no longer hide it once any single item (Boots) is owned.
 	bool bShow = false;
-	if (GS && GS->bMatchStarted && Runner && Grid && !Runner->HasBoots())
+	if (GS && GS->bMatchStarted && Runner && Grid)
 	{
 		const FIntPoint RunnerCell = Runner->GetGridCell();
 		const FIntPoint MerchantCell = Grid->GetMerchantCell();
@@ -826,15 +1656,32 @@ void UKodoHudWidget::UpdateShopPanel() const
 
 	ShopPanel->SetVisibility(ESlateVisibility::Visible);
 
-	const bool bCanAfford = GS && GS->Gold >= static_cast<float>(ARunnerCharacter::BootsCost);
-	if (BootsButton)
+	// Per-item label + affordability/owned gating.
+	const float Gold = GS ? GS->Gold : 0.f;
+	for (int32 i = 0; i < ShopItems.Num(); ++i)
 	{
-		BootsButton->SetIsEnabled(bCanAfford);
-	}
-	if (BootsLabel)
-	{
-		BootsLabel->SetText(FText::FromString(
-			bCanAfford ? TEXT("Boots of Speed — 150g") : TEXT("Boots of Speed — need 150g")));
+		const EKodoItem Item = ShopItems[i];
+		const FKodoItemDef& Def = KodoItemDef(Item);
+		const bool bOwned = !Def.bConsumable && Runner && Runner->HasItem(Item);
+		const bool bFull = Runner && Runner->GetInventoryCount() >= Runner->GetInventorySize();
+		const bool bAfford = Gold >= static_cast<float>(Def.Cost);
+		// Enable only if affordable, not already owned (passives), and there's room.
+		const bool bEnabled = bAfford && !bOwned && !bFull;
+
+		if (ShopButtons.IsValidIndex(i) && ShopButtons[i])
+		{
+			ShopButtons[i]->SetIsEnabled(bEnabled);
+		}
+		if (ShopLabels.IsValidIndex(i) && ShopLabels[i])
+		{
+			FString LabelText = FString::Printf(TEXT("%s — %dg"), *Def.Name, Def.Cost);
+			if (bOwned)        { LabelText += TEXT(" (owned)"); }
+			else if (bFull)    { LabelText += TEXT(" (full)"); }
+			else if (!bAfford) { LabelText += TEXT(" (need gold)"); }
+			ShopLabels[i]->SetText(FText::FromString(LabelText));
+			ShopLabels[i]->SetColorAndOpacity(FSlateColor(
+				bEnabled ? FLinearColor::White : FLinearColor(0.5f, 0.5f, 0.5f)));
+		}
 	}
 }
 
@@ -920,7 +1767,14 @@ void UKodoHudWidget::SetCardButton(const int32 Index, const FString& Label, cons
 	}
 	CardButtons[Index]->SetVisibility(ESlateVisibility::Visible);
 	CardButtons[Index]->SetIsEnabled(bEnabled);
-	CardButtons[Index]->SetBackgroundColor(CardIconColor(Label)); // color-coded action "icon" tile
+	const FLinearColor IconColor = CardIconColor(Label);
+	CardButtons[Index]->SetBackgroundColor(IconColor); // color-coded action "icon" tile
+	// Remember this card's normal color so UpdateAbilityCooldowns can restore it after graying /
+	// flashing / arming an ability slot (guarded — CardBaseColor is sized 12 alongside the buttons).
+	if (CardBaseColor.IsValidIndex(Index))
+	{
+		CardBaseColor[Index] = IconColor;
+	}
 	// Hover pop-over (e.g. "Requires research at the Upgrade Center" on a grayed-out button).
 	CardButtons[Index]->SetToolTipText(Tooltip.IsEmpty() ? FText::GetEmpty() : FText::FromString(Tooltip));
 	CardLabels[Index]->SetText(FText::FromString(Label));
@@ -951,11 +1805,33 @@ FString UKodoHudWidget::MakeContextKey() const
 		                       GS->Upgrades.MasonryLvl, GS->Upgrades.AxeLvl, GS->Upgrades.GoldBonusLvl);
 	}
 	// Hero-skill unlocks affect both the Upgrade Center research card and the runner skill card.
+	// Hero class + level are included so the runner command card rebuilds when the chosen hero
+	// changes OR the hero levels up (leveling unlocks ability slots — Pass 4).
 	if (const ARunnerCharacter* Runner = PC->GetRunner())
 	{
-		Key += FString::Printf(TEXT("|hs%d%d%d%d"), Runner->IsSkill2Unlocked(), Runner->IsSkill3Unlocked(),
-		                       static_cast<int32>(Runner->GetHeroClass()), Runner->IsManaRegenUpgraded());
+		Key += FString::Printf(TEXT("|hs%d%d%d%d|hc%d|hl%d"), Runner->IsSkill2Unlocked(), Runner->IsSkill3Unlocked(),
+		                       static_cast<int32>(Runner->GetHeroClass()), Runner->IsManaRegenUpgraded(),
+		                       static_cast<int32>(Runner->GetHeroClass()), Runner->GetHeroLevel());
+		// War-Altar hero-upgrade levels: include the sum so the war_altar card re-renders (cost/level
+		// labels + affordability) the moment a stat is purchased.
+		const int32 HeroUpgradeSum =
+			Runner->GetHeroStatLevel(EKodoHeroStat::Damage) +
+			Runner->GetHeroStatLevel(EKodoHeroStat::Armor) +
+			Runner->GetHeroStatLevel(EKodoHeroStat::AttackSpeed) +
+			Runner->GetHeroStatLevel(EKodoHeroStat::ManaRegen) +
+			Runner->GetHeroStatLevel(EKodoHeroStat::MaxHealth);
+		// Also include the total queued-upgrade count so the war_altar card re-renders the moment an
+		// upgrade is queued or a queued upgrade finishes (labels: "+N queued", cost, enable state).
+		const int32 HeroQueuedSum =
+			Runner->GetQueuedStatCount(EKodoHeroStat::Damage) +
+			Runner->GetQueuedStatCount(EKodoHeroStat::Armor) +
+			Runner->GetQueuedStatCount(EKodoHeroStat::AttackSpeed) +
+			Runner->GetQueuedStatCount(EKodoHeroStat::ManaRegen) +
+			Runner->GetQueuedStatCount(EKodoHeroStat::MaxHealth);
+		Key += FString::Printf(TEXT("|hu%d|hq%d"), HeroUpgradeSum, HeroQueuedSum);
 	}
+	// TEST Gun Mode flag so the runner command card rebuilds (and the Gun Mode button relabels) on toggle.
+	Key += FString::Printf(TEXT("|gm%d"), PC->IsGunMode() ? 1 : 0);
 	return Key;
 }
 
@@ -1071,23 +1947,90 @@ void UKodoHudWidget::RebuildCommandCardIfNeeded()
 		}
 		else if (State.StructureId == FName("command_center"))
 		{
-			// Command Center: ECONOMY / support research (gold, wood-harvest, building HP).
+			// Command Center: ECONOMY / support research (gold, wood-harvest, building HP, wall tech).
 			struct FResearchRow { const TCHAR* Label; EKodoResearch Type; };
-			const FResearchRow Rows[3] = {
+			const FResearchRow Rows[4] = {
 				{ TEXT("Gold Bonus\n100g 40w"), EKodoResearch::GoldBonus },
 				{ TEXT("Lumber Axes\n80g 30w"), EKodoResearch::Axe },
 				{ TEXT("Masonry HP\n120g 60w"), EKodoResearch::Masonry },
+				{ TEXT("Magic Wall\n150g 100w"), EKodoResearch::MagicWall },
 			};
-			for (int32 i = 0; i < 3; ++i)
+			// Reflect the one-time Magic Wall unlock so its button reads/locks correctly.
+			const bool bMagicWall = GS && GS->Upgrades.bMagicWallUnlocked;
+			for (int32 i = 0; i < 4; ++i)
 			{
 				const EKodoResearch Type = Rows[i].Type;
-				SetCardButton(i, Rows[i].Label, true, [WeakPC, Type]
+				bool bEnabled = true;
+				FString Label = Rows[i].Label;
+				FString Tip;
+				if (Type == EKodoResearch::MagicWall && bMagicWall)
+				{
+					bEnabled = false; Label = TEXT("Magic Wall\nUnlocked"); Tip = TEXT("Already researched");
+				}
+				SetCardButton(i, Label, bEnabled, [WeakPC, Type]
 				{
 					if (WeakPC.IsValid()) { WeakPC->TryResearch(Type); }
-				});
+				}, Tip);
 				// Flag this slot so UpdateCardProgress draws a loading bar while this research is in progress.
 				if (CardIsResearch.IsValidIndex(i)) { CardIsResearch[i] = true; CardResearchType[i] = Type; }
 			}
+		}
+		else if (State.StructureId == FName("war_altar"))
+		{
+			// War Altar: permanent hero stat upgrades (combat viability). Five buttons; each shows the
+			// current level / cost, locks at MAX, greys out when unaffordable, and on click buys one
+			// level via the hero's UpgradeHeroStat. Reads live levels/costs through the runner getters.
+			ARunnerCharacter* R = WeakPC.IsValid() ? WeakPC->GetRunner() : nullptr;
+			const float Gold = GS ? GS->Gold : 0.f;
+
+			struct FStatRow { const TCHAR* Name; EKodoHeroStat Stat; const TCHAR* Tip; };
+			const FStatRow Rows[5] = {
+				{ TEXT("Damage"),       EKodoHeroStat::Damage,      TEXT("+8 attack damage per level.") },
+				{ TEXT("Armor"),        EKodoHeroStat::Armor,       TEXT("-10% incoming damage per level (max 50%).") },
+				{ TEXT("Attack Speed"), EKodoHeroStat::AttackSpeed, TEXT("-12% attack interval per level (max -60%).") },
+				{ TEXT("Mana Regen"),   EKodoHeroStat::ManaRegen,   TEXT("+2 mana per second per level.") },
+				{ TEXT("Max HP"),       EKodoHeroStat::MaxHealth,   TEXT("+75 max HP per level (heals you on purchase).") },
+			};
+
+			for (int32 i = 0; i < 5; ++i)
+			{
+				const EKodoHeroStat Stat = Rows[i].Stat;
+				const int32 Level = R ? R->GetHeroStatLevel(Stat) : 0;          // APPLIED level
+				const int32 Queued = R ? R->GetQueuedStatCount(Stat) : 0;       // pending (timed) upgrades
+				const int32 MaxLevel = R ? R->GetHeroStatMaxLevel() : 5;
+				// "Full" once applied + queued reaches the cap (no more can be bought/queued).
+				const bool bFull = (Level + Queued) >= MaxLevel;
+				const int32 Cost = R ? R->GetHeroStatCost(Stat) : 0;            // counts queued already
+
+				// First line: "Name Lv X/5" (X = applied level) + " (+N)" when upgrades are queued.
+				FString TopLine = FString::Printf(TEXT("%s Lv %d/%d"), Rows[i].Name, Level, MaxLevel);
+				if (Queued > 0)
+				{
+					TopLine += FString::Printf(TEXT(" (+%d)"), Queued);
+				}
+
+				FString Label;
+				if (bFull)
+				{
+					Label = FString::Printf(TEXT("%s\nMAX"), *TopLine);
+				}
+				else
+				{
+					Label = FString::Printf(TEXT("%s\n%dg"), *TopLine, Cost);
+				}
+
+				const bool bAffordable = !bFull && R && Gold >= static_cast<float>(Cost);
+				const bool bEnabled = !bFull && bAffordable;
+
+				SetCardButton(i, Label, bEnabled, [WeakPC, Stat]
+				{
+					if (ARunnerCharacter* Runner = WeakPC.IsValid() ? WeakPC->GetRunner() : nullptr)
+					{
+						Runner->UpgradeHeroStat(Stat);
+					}
+				}, FString(Rows[i].Tip));
+			}
+			// 2x2 building: no sell button (consistent with the Upgrade Center, also 2x2).
 		}
 		else if (State.StructureId == FName("basic_tower"))
 		{
@@ -1191,65 +2134,92 @@ void UKodoHudWidget::RebuildCommandCardIfNeeded()
 				if (WeakPC.IsValid()) { WeakPC->SelectBlueprint(FName("basic_tower")); }
 				Self->bBuildSubmenu = false;
 			});
-			SetCardButton(3, TEXT("Magic Wall\n5g"), true, [WeakPC, Self]
-			{
-				if (WeakPC.IsValid()) { WeakPC->SelectBlueprint(FName("magic_wall")); }
-				Self->bBuildSubmenu = false;
-			});
+			// (Magic Wall removed as a buildable: it's now the wall's final tier, unlocked by the
+			//  Magic Wall research at the Command Center.)
 			SetCardButton(4, TEXT("Upgrade Center\n50g"), true, [WeakPC, Self]
 			{
 				if (WeakPC.IsValid()) { WeakPC->SelectBlueprint(FName("upgrade_center")); }
+				Self->bBuildSubmenu = false;
+			});
+			SetCardButton(5, TEXT("War Altar\n150g"), true, [WeakPC, Self]
+			{
+				if (WeakPC.IsValid()) { WeakPC->SelectBlueprint(FName("war_altar")); }
 				Self->bBuildSubmenu = false;
 			});
 			SetCardButton(11, TEXT("Back"), true, [Self] { Self->bBuildSubmenu = false; });
 		}
 		else
 		{
-			// Per-class skill names for the 3-slot layout.
-			const ARunnerCharacter* SkillRunner = WeakPC.IsValid() ? WeakPC->GetRunner() : nullptr;
-			const EKodoHeroClass HClass = SkillRunner ? SkillRunner->GetHeroClass() : EKodoHeroClass::MountainKing;
-			const bool bS2 = SkillRunner && SkillRunner->IsSkill2Unlocked();
-			const bool bS3 = SkillRunner && SkillRunner->IsSkill3Unlocked();
+			// Data-driven 4-slot ability kit (Pass 4). Availability is by hero LEVEL, OR via the
+			// Upgrade-Center research (slot 1 = Hero Skill 2, slot 3 = Hero Skill 3) — see IsAbilityUnlocked.
+			ARunnerCharacter* R = WeakPC.IsValid() ? WeakPC->GetRunner() : nullptr;
 
-			const TCHAR* Slot1Name = TEXT("Spell");
-			const TCHAR* Slot2Name = TEXT("Passive");
-			const TCHAR* Slot3Name = TEXT("Skill 3");
-			switch (HClass)
+			// Ability slot S -> card index S (slot0->card0, slot1->card1, passive(2)->card2, ult(3)->card3).
+			for (int32 S = 0; S < 4; ++S)
 			{
-			case EKodoHeroClass::MountainKing:
-				Slot1Name = TEXT("Thunder Clap"); Slot2Name = TEXT("Toughness"); Slot3Name = TEXT("Avatar"); break;
-			case EKodoHeroClass::DeathKnight:
-				Slot1Name = TEXT("Death Coil"); Slot2Name = TEXT("Structure Regen"); Slot3Name = TEXT("Death Pact"); break;
-			case EKodoHeroClass::Blademaster:
-				Slot1Name = TEXT("Wind Walk"); Slot2Name = TEXT("Swiftness"); Slot3Name = TEXT("Blink"); break;
-			default:
-				Slot1Name = TEXT("Deploy Bot"); Slot2Name = TEXT("Repair Mastery"); Slot3Name = TEXT("Rocket Salvo"); break;
-			}
+				const FString Name = R ? R->GetAbilityName(S) : FString();
+				const bool bUnlocked = R && R->IsAbilityUnlocked(S);
+				const bool bPassive = R && R->IsAbilitySlotPassive(S);
+				const int32 UnlockLvl = R ? R->GetAbilityUnlockLevel(S) : 99;
 
-			// Slot 1: signature active (Q), always available; costs mana.
-			SetCardButton(0, FString::Printf(TEXT("%s (Q)\nactive"), Slot1Name), true, [WeakPC]
-			{
-				if (WeakPC.IsValid()) { WeakPC->CastHeroSkill(0); }
-			});
+				const TCHAR* KeyHint = (S == 0) ? TEXT("Q") : (S == 1) ? TEXT("E") : (S == 3) ? TEXT("R") : TEXT("");
 
-			// Slot 2: passive. Enabled (not grayed) when active; grayed when not yet researched.
-			SetCardButton(1, Slot2Name, bS2, [] {},
-			              bS2 ? TEXT("Passive — always active") : TEXT("Requires research at the Upgrade Center"));
-
-			// Slot 3: researched active (R). Castable only when unlocked; grayed + tooltip otherwise.
-			if (bS3)
-			{
-				SetCardButton(2, FString::Printf(TEXT("%s (R)\nactive"), Slot3Name), true, [WeakPC]
+				// Hover tooltip: name, what it does, then cost/cooldown (or the passive/locked note).
+				FString Tip = Name;
+				if (R) { Tip += TEXT("\n") + R->GetAbilityDescription(S); }
+				if (bPassive)
 				{
-					if (WeakPC.IsValid()) { WeakPC->CastHeroSkill(2); }
-				});
-			}
-			else
-			{
-				SetCardButton(2, Slot3Name, false, [] {}, TEXT("Requires research at the Upgrade Center"));
+					Tip += bUnlocked ? TEXT("\n\nPassive — always active")
+					                 : FString::Printf(TEXT("\n\nUnlocks at level %d"), UnlockLvl);
+				}
+				else
+				{
+					Tip += FString::Printf(TEXT("\n\nMana: %.0f    Cooldown: %.0fs"),
+					                       R ? R->GetAbilityManaCost(S) : 0.f, R ? R->GetAbilityCooldown(S) : 0.f);
+					if (!bUnlocked)
+					{
+						Tip += FString::Printf(TEXT("\nUnlocks at level %d"), UnlockLvl);
+						// Slots 1 & 3 can also be unlocked early by research at the Upgrade Center.
+						if (S == 1) { Tip += TEXT(" (or research Hero Skill 2)"); }
+						else if (S == 3) { Tip += TEXT(" (or research Hero Skill 3)"); }
+					}
+				}
+
+				if (bPassive)
+				{
+					SetCardButton(S, Name, bUnlocked, [] {}, Tip);
+				}
+				else if (bUnlocked)
+				{
+					SetCardButton(S, FString::Printf(TEXT("%s (%s)\nactive"), *Name, KeyHint), true, [WeakPC, S]
+					{
+						if (WeakPC.IsValid()) { WeakPC->CastHeroSkill(S); }
+					}, Tip);
+				}
+				else
+				{
+					SetCardButton(S, Name, false, [] {}, Tip);
+				}
 			}
 
-			SetCardButton(3, TEXT("Build (B)"), true, [Self] { Self->bBuildSubmenu = true; });
+			// Attack the nearest kodo (or right-click a kodo / your own building).
+			SetCardButton(4, TEXT("Attack"), true, [WeakPC]
+			{
+				if (WeakPC.IsValid())
+				{
+					if (ARunnerCharacter* R = WeakPC->GetRunner()) { R->AttackNearestKodo(); }
+				}
+			}, TEXT("Attack the nearest Kodo (or right-click a Kodo / your building)"));
+
+			// Build submenu entry (moved from the old slot-3 Build button).
+			SetCardButton(5, TEXT("Build (B)"), true, [Self] { Self->bBuildSubmenu = true; });
+
+			// TEST Gun Mode toggle (card 6): hold Left-Click to shoot toward the cursor. Label reflects state.
+			const bool bGunOn = WeakPC.IsValid() && WeakPC->IsGunMode();
+			SetCardButton(6, bGunOn ? TEXT("Gun Mode ON\n(G)") : TEXT("Gun Mode\n(G)"), true, [WeakPC]
+			{
+				if (WeakPC.IsValid()) { WeakPC->ToggleGunMode(); }
+			}, TEXT("Toggle aim mode: hold Left-Click to shoot toward the cursor (~6 tiles, 1/s)"));
 		}
 	}
 }
@@ -1332,10 +2302,13 @@ void UKodoHudWidget::UpdateDetailsPanel() const
 			Name = FString::Printf(TEXT("Runner — %s (Lv %d)"), *ClassName, Runner->GetHeroLevel());
 			switch (Runner->GetHeroClass())
 			{
-			case EKodoHeroClass::MountainKing: Portrait = TEXT("MK"); PortraitColor = FLinearColor(0.f, 0.55f, 0.65f); break;
-			case EKodoHeroClass::DeathKnight:  Portrait = TEXT("DK"); PortraitColor = FLinearColor(0.25f, 0.35f, 0.2f); break;
-			case EKodoHeroClass::Blademaster:  Portrait = TEXT("BM"); PortraitColor = FLinearColor(0.6f, 0.3f, 0.25f); break;
-			default:                           Portrait = TEXT("TK"); PortraitColor = FLinearColor(0.5f, 0.35f, 0.5f); break;
+			case EKodoHeroClass::MountainKing: Portrait = TEXT("MK"); PortraitColor = FLinearColor(0.f, 0.55f, 0.65f);    break;
+			case EKodoHeroClass::Blademaster:  Portrait = TEXT("BM"); PortraitColor = FLinearColor(0.6f, 0.3f, 0.25f);    break;
+			case EKodoHeroClass::Archmage:     Portrait = TEXT("AM"); PortraitColor = FLinearColor(0.46f, 0.62f, 0.93f);  break;
+			case EKodoHeroClass::FarSeer:      Portrait = TEXT("FS"); PortraitColor = FLinearColor(0.42f, 0.72f, 0.45f);  break;
+			case EKodoHeroClass::Paladin:      Portrait = TEXT("PA"); PortraitColor = FLinearColor(0.92f, 0.82f, 0.45f);  break;
+			case EKodoHeroClass::Dreadlord:    Portrait = TEXT("DL"); PortraitColor = FLinearColor(0.55f, 0.30f, 0.62f);  break;
+			default:                           Portrait = TEXT("??"); PortraitColor = FLinearColor(0.5f, 0.35f, 0.5f);    break;
 			}
 			Stats = FString::Printf(TEXT("Lv %d  XP %d/%d   Mana %.0f/%.0f   Speed %.0f   Spell CD %.1fs   Pack %d/50"),
 			                        Runner->GetHeroLevel(), Runner->GetHeroXp(), Runner->GetXpForNextLevel(),
@@ -1379,6 +2352,37 @@ void UKodoHudWidget::UpdateDetailsPanel() const
 		else
 		{
 			ManaBar->SetVisibility(ESlateVisibility::Collapsed);
+		}
+	}
+
+	// Inventory row: only meaningful for the hero. Show the held items (short name, or "-" for empty)
+	// when the runner is selected; collapse the whole row for building/kodo selections so no stray
+	// slots/numbers show.
+	if (InventoryBox)
+	{
+		const ARunnerCharacter* InvRunner = bRunnerSelected ? PC->GetRunner() : nullptr;
+		if (InvRunner)
+		{
+			InventoryBox->SetVisibility(ESlateVisibility::Visible);
+			for (int32 i = 0; i < InventoryLabels.Num(); ++i)
+			{
+				const EKodoItem Item = InvRunner->GetInventoryItem(i);
+				if (InventoryLabels[i])
+				{
+					InventoryLabels[i]->SetText(FText::FromString(KodoItemAbbrev(Item)));
+					InventoryLabels[i]->SetColorAndOpacity(FSlateColor(Item == EKodoItem::None
+						? FLinearColor(0.4f, 0.37f, 0.3f) : FLinearColor(0.9f, 0.85f, 0.65f)));
+				}
+				if (InventorySlots.IsValidIndex(i) && InventorySlots[i])
+				{
+					InventorySlots[i]->SetBrushColor(Item == EKodoItem::None
+						? FLinearColor(0.16f, 0.13f, 0.08f) : FLinearColor(0.26f, 0.21f, 0.10f));
+				}
+			}
+		}
+		else
+		{
+			InventoryBox->SetVisibility(ESlateVisibility::Collapsed);
 		}
 	}
 }
@@ -1555,11 +2559,26 @@ void UKodoHudWidget::NativeTick(const FGeometry& MyGeometry, const float InDelta
 	UpdateShopPanel();
 	UpdateEndOverlay();
 	UpdateCardProgress();
+	UpdateAbilityCooldowns();
+	UpdateProductionPanel();
+	UpdateEditorPalette();
+	UpdateEditorChrome();
 
-	// The minimap redraw scans all 25,600 cells and re-uploads the texture to the GPU;
-	// at ~12 Hz it's visually identical but far cheaper than doing it every frame.
+	// Fade the editor "Map saved" message after a few seconds.
+	if (EditorMsgTimer > 0.f)
+	{
+		EditorMsgTimer -= InDeltaTime;
+		if (EditorMsgTimer <= 0.f && EditorMsgText)
+		{
+			EditorMsgText->SetText(FText::GetEmpty());
+		}
+	}
+
+	// The minimap redraw scans the whole grid (now 90,000 cells on the 300x300 map) and re-uploads
+	// the texture to the GPU. At 4x the cells this got expensive at 12 Hz, so it runs at ~5 Hz —
+	// visually fine for a minimap and a clear CPU/upload saving on the big map.
 	MinimapRebuildAccum += InDeltaTime;
-	if (MinimapRebuildAccum >= 0.08f)
+	if (MinimapRebuildAccum >= 0.2f)
 	{
 		MinimapRebuildAccum = 0.f;
 		RebuildMinimapTexture();

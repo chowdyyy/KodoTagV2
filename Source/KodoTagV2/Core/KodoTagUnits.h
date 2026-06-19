@@ -17,11 +17,12 @@ namespace KodoUnits
 	/** Multiply any prototype px value by this to get Unreal Units. ~5.3571 */
 	constexpr float PxToUU = CellSizeUU / ProtoTileSizePx;
 
-	/** Grid dimensions = the WC3 map's PLAYABLE area (148x150 tiles), one cell per tile,
-	 * squared to 150 for simplicity. This is the faithful 1:1 size that matches the
-	 * original minimap exactly (bases sit at the playable edges). */
-	constexpr int32 GridCols = 150;
-	constexpr int32 GridRows = 150;
+	/** Grid dimensions. Doubled from the faithful 150x150 to 300x300 (creator request: 2x the
+	 * walkable distance, same cell size). The KodoMapLayout.txt layout was regenerated at 300x300
+	 * (features spread to fill, walls/ridges kept 1-cell-thick + solid). Cell size, kodo/building/
+	 * hero sizes are unchanged — only the playfield (and minimap, ground plane via MapExtentUU) grows. */
+	constexpr int32 GridCols = 300;
+	constexpr int32 GridRows = 300;
 
 	/** World height per elevation level: 24 px per level (game.js:497). ~128.57 UU */
 	constexpr float ElevationStepUU = 24.f * PxToUU;

@@ -25,6 +25,8 @@ struct FKodoUpgrades
 	UPROPERTY(BlueprintReadOnly, Category = "Kodo") int32 MasonryLvl = 1; // max 3
 	UPROPERTY(BlueprintReadOnly, Category = "Kodo") int32 AxeLvl = 1;     // max 3
 	UPROPERTY(BlueprintReadOnly, Category = "Kodo") int32 GoldBonusLvl = 0; // max 3 — bonus-gold mining tech
+	/** Command-Center research: unlocks the wall's FINAL (top) tier upgrade. */
+	UPROPERTY(BlueprintReadOnly, Category = "Kodo") bool bMagicWallUnlocked = false;
 
 	bool IsUnlocked(const FName Flag) const
 	{
@@ -33,6 +35,7 @@ struct FKodoUpgrades
 		if (Flag == FName("aoeUnlocked")) { return bAoeUnlocked; }
 		if (Flag == FName("multishotUnlocked")) { return bMultishotUnlocked; }
 		if (Flag == FName("auraUnlocked")) { return bAuraUnlocked; }
+		if (Flag == FName("magicWallUnlocked")) { return bMagicWallUnlocked; }
 		return false;
 	}
 };

@@ -27,6 +27,7 @@ enum class EKodoResearch : uint8
 	Masonry,   // 120g  60w, max 3, retroactive x1.35 HP
 	Axe,       //  80g  30w, max 3
 	GoldBonus, // 100g  40w, max 3, bonus-gold mining chance
+	MagicWall, // 150g 100w, one-time: unlocks the wall's final tier (economy gate: Command Center)
 	HeroSkill2,// 120g  60w, unlocks the hero's slot-2 passive (offensive gate: Upgrade Center)
 	HeroSkill3,// 200g 100w, unlocks the hero's slot-3 active spell (offensive gate: Upgrade Center)
 	ManaRegen  // 200g   0w, one-time: doubles the hero's mana regen (offensive gate: Upgrade Center)
@@ -51,9 +52,11 @@ public:
 	/**
 	 * Top-left cell a 2x2 building will actually occupy for a given cursor cell:
 	 * snaps to the underlying gold mine when over one (keeps mine shafts buildable on
-	 * off-lattice mines), otherwise the exact cursor cell (1-cell granularity, no lattice
-	 * snap — 2x2 buildings can sit tight against trees/walls). 1x1 = cursor cell.
-	 * Shared by PlaceStructure and the build ghost so the preview never lies.
+	 * off-lattice mines); else, for BARRIERS (walls + shooting towers) snaps to the even
+	 * 2x2 lattice (0-1, 2-3, 4-5 ...) so a row of them tiles flush with no 1-cell jog a
+	 * Kodo could shortcut through; the big economy/tech buildings keep exact-cursor 1-cell
+	 * granularity. 1x1 = cursor cell. Shared by PlaceStructure and the build ghost so the
+	 * preview never lies.
 	 */
 	UFUNCTION(BlueprintPure, Category = "KodoBuild")
 	FIntPoint ComputeBuildOrigin(const FIntPoint& Cell, FName PresetId) const;
@@ -80,6 +83,22 @@ public:
 	 */
 	UFUNCTION(BlueprintPure, Category = "KodoBuild")
 	float GetResearchProgress(EKodoResearch Type, float& OutRemaining) const;
+
+	/**
+	 * Full status of an in-progress research, for the command-card production panel. Searches
+	 * ActiveResearches for Type; if found, fills the display name, elapsed fraction (0..1),
+	 * seconds remaining, and total seconds, and returns true. Returns false if not researching.
+	 */
+	UFUNCTION(BlueprintPure, Category = "KodoBuild")
+	bool GetResearchStatus(EKodoResearch Type, FString& OutName, float& OutFrac, float& OutRemaining, float& OutTotal) const;
+
+	/**
+	 * Construction progress for a cell, for the command-card production panel. Searches Constructions
+	 * for an entry on Cell; if found, fills total seconds, seconds remaining, and elapsed fraction
+	 * (0..1), and returns true. Returns false if that cell is not under construction.
+	 */
+	UFUNCTION(BlueprintPure, Category = "KodoBuild")
+	bool GetConstructionProgress(const FIntPoint& Cell, float& OutFrac, float& OutRemaining, float& OutTotal) const;
 
 	/** Port of upgradeBasicTowerTo (game.js:2009-2129) with the morph cost table (game.js:2424-2433). */
 	UFUNCTION(BlueprintCallable, Category = "KodoBuild")

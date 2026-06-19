@@ -61,6 +61,9 @@ public:
 	/** Mark a cell as a walkable ramp with an ascent direction (0=E 1=W 2=S 3=N). Bounds-checked. */
 	void SetRamp(const FIntPoint& Cell, int32 Dir);
 
+	/** Clear a cell's walkable-ramp flag (ramp off, dir -1). Bounds-checked. */
+	void ClearRamp(const FIntPoint& Cell);
+
 	/** Set a ramp cell's slope low/high world Z (bootstrapper slope pass). */
 	void SetRampSlope(const FIntPoint& Cell, float BotZ, float TopZ);
 
@@ -251,6 +254,10 @@ private:
 	TArray<int32> Field1Next, Field2Next;
 	FIntPoint FlowTarget = FIntPoint(-9999, -9999);
 	uint64 FlowComputeFrame = (uint64)-1;
+	/** World time of the last flow-field recompute. The field is a full Dijkstra over the whole
+	 *  grid (x2 fields); on the big 300x300 map that's expensive, so recomputes are throttled to
+	 *  a min interval — Kodos repath every ~0.35-0.6 s anyway, so a slightly stale field is fine. */
+	float LastFlowComputeTime = -100.f;
 	/** Set when the grid changes (wall built/destroyed) so the field recomputes. */
 	bool bFlowDirty = true;
 };

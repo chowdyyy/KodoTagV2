@@ -69,6 +69,16 @@ AKodoCharacter::AKodoCharacter()
 	HealthBarComponent->SetGenerateOverlapEvents(false);
 	HealthBarComponent->SetCastShadow(false);
 	HealthBarComponent->SetTickWhenOffscreen(false);
+
+	// Front indicator ("snout/head"). Child of the per-type BodyMesh (created in the base
+	// constructor, valid here) so it inherits the body's rotation and always marks the front.
+	// Mesh/tint/offset are finalised per-type in InitKodo; here we just wire it up cheaply:
+	// no collision, no overlap events, no shadow (top-down blockout style).
+	SnoutMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("SnoutMesh"));
+	SnoutMesh->SetupAttachment(BodyMesh);
+	SnoutMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	SnoutMesh->SetGenerateOverlapEvents(false);
+	SnoutMesh->SetCastShadow(false);
 }
 
 void AKodoCharacter::BeginPlay()
@@ -165,13 +175,16 @@ void AKodoCharacter::InitKodo(const EKodoType InType, const int32 SpawnTier,
 	// Per-type silhouette: distinct mesh SHAPE + proportions (plus the color below) so the four
 	// types read apart at a glance. Footprint (1 Speed / 2 others) is unchanged for the maze.
 	const TCHAR* TypeMeshPath = TEXT("/Engine/BasicShapes/Cylinder.Cylinder");
-	float DiamFactor = 0.85f, BodyHeightScale = 1.9f;
+	// Big (2-cell) Kodos fill their FULL 2x2 footprint so they read the SAME SIZE as a 2x2
+	// wall/tower (creator request). Speed (1-cell) stays small/player-sized. Types still read
+	// apart by SHAPE (cylinder/cube/cone), color, and height — not width.
+	float DiamFactor = 1.0f, BodyHeightScale = 1.9f;
 	switch (InType)
 	{
-	case EKodoType::Speed: TypeMeshPath = TEXT("/Engine/BasicShapes/Cylinder.Cylinder"); DiamFactor = 0.70f; BodyHeightScale = 1.5f; break; // small slim
-	case EKodoType::Tank:  TypeMeshPath = TEXT("/Engine/BasicShapes/Cube.Cube");          DiamFactor = 0.98f; BodyHeightScale = 1.5f; break; // wide blocky
-	case EKodoType::Blink: TypeMeshPath = TEXT("/Engine/BasicShapes/Cone.Cone");          DiamFactor = 0.95f; BodyHeightScale = 2.8f; break; // tall spike
-	default: break; // Standard: baseline cylinder
+	case EKodoType::Speed: TypeMeshPath = TEXT("/Engine/BasicShapes/Cylinder.Cylinder"); DiamFactor = 0.70f; BodyHeightScale = 1.5f; break; // small slim (1-cell)
+	case EKodoType::Tank:  TypeMeshPath = TEXT("/Engine/BasicShapes/Cube.Cube");          DiamFactor = 1.0f;  BodyHeightScale = 1.5f; break; // full 2x2 blocky
+	case EKodoType::Blink: TypeMeshPath = TEXT("/Engine/BasicShapes/Cone.Cone");          DiamFactor = 1.0f;  BodyHeightScale = 2.8f; break; // full 2x2 tall spike
+	default: break; // Standard: full 2x2 cylinder
 	}
 	const float BodyDiameterUU = FootprintWidthUU * DiamFactor;
 	BaseBodyScale = FVector(BodyDiameterUU / 100.f, BodyDiameterUU / 100.f, BodyHeightScale);
@@ -202,6 +215,53 @@ void AKodoCharacter::InitKodo(const EKodoType InType, const int32 SpawnTier,
 		default:               if (Grid) { TypeColor = Grid->GetMapColor(EKodoMapColor::Kodo); } break;
 		}
 		KodoTint::Apply(BodyMesh, TypeColor);
+
+		// Front "snout" indicator: a small cone poking out the +X (forward) face of the body
+		// so the top-down camera can read which way each kodo is heading. It is a child of
+		// BodyMesh, so its transform is expressed in the BODY's local space — which is scaled
+		// by BaseBodyScale. We divide the world-space sizes/offsets by that scale to keep the
+		// snout a consistent real size regardless of the body's per-type stretch. Tank gets a
+		// chunkier snout, Speed a longer pointier one; others a neutral nub.
+		if (SnoutMesh)
+		{
+			if (UStaticMesh* Cone = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cone.Cone")))
+			{
+				SnoutMesh->SetStaticMesh(Cone);
+			}
+
+			// Desired world-space snout footprint (UU): diameter ~35% of the body, length tuned per type.
+			float SnoutDiamUU = BodyDiameterUU * 0.35f;
+			float SnoutLenUU  = BodyDiameterUU * 0.40f;
+			switch (InType)
+			{
+			case EKodoType::Speed: SnoutDiamUU = BodyDiameterUU * 0.30f; SnoutLenUU = BodyDiameterUU * 0.60f; break; // pointier
+			case EKodoType::Tank:  SnoutDiamUU = BodyDiameterUU * 0.45f; SnoutLenUU = BodyDiameterUU * 0.40f; break; // chunkier
+			default: break;
+			}
+
+			// The engine cone is ~100 UU tall along +Z and ~100 UU wide; we want it pointing along
+			// +X. Pitch +90° rotates its +Z tip toward +X. Sizes/offset are pre-divided by the body
+			// scale so the snout reads the same physical size under any per-type body stretch.
+			const float SX = FMath::Max(KINDA_SMALL_NUMBER, BaseBodyScale.X);
+			const float SZ = FMath::Max(KINDA_SMALL_NUMBER, BaseBodyScale.Z);
+			SnoutMesh->SetRelativeRotation(FRotator(90.f, 0.f, 0.f));
+			SnoutMesh->SetRelativeScale3D(FVector(
+				(SnoutDiamUU / 100.f) / SX,
+				(SnoutDiamUU / 100.f) / SX,
+				(SnoutLenUU  / 100.f) / SX));
+			// Sit on the front rim of the body: half the body diameter out along +X, at mid-height.
+			// BodyMesh already carries BaseBodyOffset (footprint centring), so the snout's local
+			// offset is relative to the body centre — no need to re-add it here.
+			SnoutMesh->SetRelativeLocation(FVector(
+				(BodyDiameterUU * 0.5f) / SX,
+				0.f,
+				(35.f) / SZ));
+
+			// Contrasting tint: a darkened version of the body color so the front reads as a
+			// distinct "head" from the top-down camera without clashing with the type color.
+			const FLinearColor SnoutColor = TypeColor * 0.35f;
+			KodoTint::Apply(SnoutMesh, SnoutColor);
+		}
 	}
 	GetCapsuleComponent()->SetCapsuleSize(BodyDiameterUU * 0.5f, 88.f);
 }
@@ -283,6 +343,33 @@ void AKodoCharacter::UpdateEnrageVisual(const bool bEnraged)
 	BodyMesh->SetRelativeScale3D(bEnraged ? BaseBodyScale * 1.15f : BaseBodyScale);
 }
 
+void AKodoCharacter::SmoothFacingToActorYaw(const float DeltaSeconds)
+{
+	// The base movement/chew code already SNAPPED the actor yaw to the desired facing
+	// (and leaves it untouched when not moving). Read that as the target and ease the real
+	// yaw toward it so the body swings into its heading instead of popping. Rotation only —
+	// the path and speed are untouched.
+	const float TargetYaw = GetActorRotation().Yaw;
+
+	if (!bFacingInit)
+	{
+		// First frame: adopt the target immediately so a freshly spawned kodo doesn't spin
+		// up from yaw 0.
+		CurrentYaw = TargetYaw;
+		bFacingInit = true;
+	}
+	else
+	{
+		// RInterpTo on a yaw-only rotator takes the shortest angular route and never snaps;
+		// ~10/s gives a brisk-but-readable turn at our movement speeds.
+		const FRotator Current(0.f, CurrentYaw, 0.f);
+		const FRotator Target(0.f, TargetYaw, 0.f);
+		CurrentYaw = FMath::RInterpTo(Current, Target, DeltaSeconds, 10.f).Yaw;
+	}
+
+	SetActorRotation(FRotator(0.f, CurrentYaw, 0.f));
+}
+
 void AKodoCharacter::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds); // base auto-follow disabled; just engine plumbing
@@ -318,6 +405,9 @@ void AKodoCharacter::Tick(float DeltaSeconds)
 			BodyMesh->SetRelativeLocation(BaseBodyOffset);
 		}
 	}
+
+	// Periodic runner-bite cooldown ticks regardless of stun/slow so contact stays survivable.
+	BiteCooldown = FMath::Max(0.f, BiteCooldown - DeltaSeconds);
 
 	if (Grid)
 	{
@@ -518,10 +608,11 @@ void AKodoCharacter::RunChaseAndChewLogic(const float DeltaSeconds)
 			bIsAttackingStructure = true;
 			bAnimAttacking = true;
 
-			// Face the wall.
+			// Face the wall (snapped target), then smooth the actual yaw toward it.
 			const FVector BlockCenter = Grid->CellToWorldCenter(BlockCell);
 			const FVector Delta = BlockCenter - GetActorLocation();
 			SetActorRotation(FRotator(0.f, FMath::RadiansToDegrees(FMath::Atan2(Delta.Y, Delta.X)), 0.f));
+			SmoothFacingToActorYaw(DeltaSeconds);
 
 			// Stand and chew: one chomp every 1.2 s (entities.js:1027-1039).
 			if (AttackCooldown > 0.f)
@@ -551,6 +642,9 @@ void AKodoCharacter::RunChaseAndChewLogic(const float DeltaSeconds)
 		bIsAttackingStructure = false;
 		bAnimAttacking = false;
 		StepAlongPath(DeltaSeconds);
+		// StepAlongPath snapped the actor yaw to the movement direction (only when actually
+		// moving); smooth the real yaw toward that so the kodo turns into its heading.
+		SmoothFacingToActorYaw(DeltaSeconds);
 	}
 
 	// 6. Eat-runner contact check (entities.js:1080-1090): radius sum in prototype px.
@@ -561,7 +655,16 @@ void AKodoCharacter::RunChaseAndChewLogic(const float DeltaSeconds)
 		const float EatRangeUU = (SizePx + 12.f) * KodoUnits::PxToUU;
 		if (FVector::Dist2D(Runner->GetActorLocation(), GetActorLocation()) <= EatRangeUU)
 		{
-			Runner->ApplyDamageAmount(100.f); // entities.js:1085 — lethal at base 100 HP
+			// Periodic, non-lethal BITE (combat viability). The old per-frame lethal 100 killed the
+			// hero the instant it approached. Now contact deals a moderate bite on a 1.2 s cadence so
+			// melee is dangerous but survivable. BiteDamage scales mildly with this kodo's CurrentDamage
+			// (tougher tiers bite a bit harder) but stays clamped to a non-lethal 15-25 band.
+			if (BiteCooldown <= 0.f)
+			{
+				const float BiteDamage = FMath::Clamp(15.f + CurrentDamage * 0.25f, 15.f, 25.f);
+				Runner->ApplyDamageAmount(BiteDamage); // entities.js:1085 (was lethal 100/frame)
+				BiteCooldown = 1.2f;
+			}
 		}
 	}
 }

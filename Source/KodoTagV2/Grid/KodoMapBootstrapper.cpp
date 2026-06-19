@@ -671,136 +671,451 @@ void AKodoMapBootstrapper::PlaceAdminTower(UKodoGridSubsystem& Grid)
 	UE_LOG(LogTemp, Log, TEXT("[KodoMap] Admin Tower placed at (%d,%d)."), Origin.X, Origin.Y);
 }
 
-void AKodoMapBootstrapper::BuildVisuals(UKodoGridSubsystem& Grid)
+AKodoMapBootstrapper::FCellRender AKodoMapBootstrapper::EvaluateCell(UKodoGridSubsystem& Grid, const FIntPoint& Coord)
 {
+	// Single source of truth for what one cell renders. The transform math below is byte-identical
+	// to the original BuildVisuals per-cell logic — only the delivery (returned struct vs. inline
+	// array append) changed. Ramp cells still write their walk-surface Z via SetRampSlope.
 	const float Cell = KodoUnits::CellSizeUU;
 	const float Step = KodoUnits::ElevationLevelStepUU;
+	const int32 X = Coord.X;
+	const int32 Y = Coord.Y;
+
+	FCellRender Out;
+
+	const float ElevZ = Grid.GetElevationZ(Coord);
+	const int32 Lvl = Grid.GetElevationLevel(Coord);
+	const bool bRamp = Grid.IsRamp(Coord);
+	const FGridCell& State = Grid.GetCell(Coord);
+	const bool bRidge = State.Type == ECellType::Cliff;
+
+	// Highest-elevation 4-neighbour drives the ridge wall height.
+	int32 HiNbrLvl = 0;
+	{
+		const int32 NDx[4] = { 1, -1, 0, 0 };
+		const int32 NDy[4] = { 0, 0, 1, -1 };
+		for (int32 d = 0; d < 4; ++d)
+		{
+			HiNbrLvl = FMath::Max(HiNbrLvl, Grid.GetElevationLevel(FIntPoint(X + NDx[d], Y + NDy[d])));
+		}
+	}
+
+	// --- Raised terrain rendering (GROUND instance) ---
+	if (bRidge)
+	{
+		// A ridge IS the edge of the upper ground: a tall cliff wall rising from the
+		// lower ground (Z=0) to the upper-ground top plus a rim lip, so the height
+		// reads clearly as the boundary of the plateau even when zoomed out.
+		const int32 EdgeLvl = FMath::Max(FMath::Max(Lvl, HiNbrLvl), 1);
+		const float WallTop = EdgeLvl * Step + 45.f; // +lip: rim stands above the platform
+		FVector C = Grid.CellToWorldCenter(Coord);
+		C.Z = WallTop * 0.5f;
+		Out.GroundHism = CliffInstances;
+		Out.GroundXform = FTransform(FQuat::Identity, C, FVector(Cell / 100.f, Cell / 100.f, WallTop / 100.f));
+		Out.bHasGround = true;
+	}
+	else if (bRamp)
+	{
+		// Directional ramp (editor-authored dir). Walk the ascent axis to find this cell's
+		// place in the run, then build one continuous slope so a 2-cell run = a 2-cell ramp,
+		// axis-aligned to the chosen direction. The slope's edge heights are stored on the
+		// grid so units/buildings ride the angle (continuous, no sinking).
+		const int32 Dir = FMath::Max(0, Grid.GetRampDir(Coord));
+		const int32 DXs[4] = { 1, -1, 0, 0 };
+		const int32 DYs[4] = { 0, 0, 1, -1 };
+		const int32 ddx = DXs[Dir], ddy = DYs[Dir];
+
+		int32 Below = 0; // ramp cells toward the lower ground (-dir)
+		for (FIntPoint c(Coord.X - ddx, Coord.Y - ddy); Grid.IsRamp(c); c = FIntPoint(c.X - ddx, c.Y - ddy)) { ++Below; }
+		int32 Above = 0; // ramp cells toward the plateau (+dir)
+		FIntPoint Top = Coord;
+		for (FIntPoint c(Coord.X + ddx, Coord.Y + ddy); Grid.IsRamp(c); c = FIntPoint(c.X + ddx, c.Y + ddy)) { ++Above; Top = c; }
+		const int32 RunLen = Below + Above + 1;
+
+		// Plateau height the ramp climbs to = the level just past the top of the run.
+		const FIntPoint Beyond(Top.X + ddx, Top.Y + ddy);
+		int32 PlLvl = Grid.GetElevationLevel(Beyond);
+		if (PlLvl <= 0) { PlLvl = FMath::Max(1, Grid.GetElevationLevel(FIntPoint(Beyond.X + ddx, Beyond.Y + ddy))); }
+		const float RisePerCell = (PlLvl * Step) / RunLen;
+		const float BotZ = Below * RisePerCell;           // low (-dir) edge of this cell
+		const float TopZ = (Below + 1) * RisePerCell;      // high (+dir) edge of this cell
+		Grid.SetRampSlope(Coord, BotZ, TopZ);              // units/buildings ride this
+
+		if (TopZ - BotZ > 0.5f)
+		{
+			const float Rise = TopZ - BotZ;
+			const float SlopeLen = FMath::Sqrt(Cell * Cell + Rise * Rise);
+			const float PitchDeg = FMath::RadiansToDegrees(FMath::Atan2(Rise, Cell)); // +X end up
+			const float YawDeg = (Dir == 0) ? 0.f : (Dir == 1) ? 180.f : (Dir == 2) ? 90.f : 270.f;
+			FVector C = Grid.CellToWorldCenter(Coord);
+			C.Z = 0.5f * (BotZ + TopZ);
+			const FRotator Rot(PitchDeg, YawDeg, 0.f);
+			Out.GroundHism = GrassToneInstances;
+			Out.GroundXform = FTransform(Rot.Quaternion(), C, FVector(SlopeLen / 100.f, Cell / 100.f, 0.40f));
+			Out.bHasGround = true;
+		}
+	}
+	else if (Lvl >= 1)
+	{
+		// Interior upper ground: a solid platform block whose sides are the cliff faces.
+		FVector C = Grid.CellToWorldCenter(Coord);
+		C.Z = ElevZ * 0.5f;
+		Out.GroundHism = GrassToneInstances;
+		Out.GroundXform = FTransform(FQuat::Identity, C, FVector(Cell / 100.f, Cell / 100.f, ElevZ / 100.f));
+		Out.bHasGround = true;
+	}
+
+	// --- Feature rendering (FEATURE instance) ---
+	if (State.Type != ECellType::Empty)
+	{
+		FVector Center = Grid.CellToWorldCenter(Coord);
+		// Trees/mines/merchant sit on top of the raised ground (0 for ground-level cells).
+		Center.Z += ElevZ;
+
+		switch (State.Type)
+		{
+		case ECellType::Cliff:
+			break; // rendered above as the tall cliff-edge wall
+
+		case ECellType::Tree:
+			// Shorter, slimmer cone (~1.6 m) so forests don't dominate the top-down read.
+			Center.Z += 80.f;
+			Out.FeatureHism = TreeInstances;
+			Out.FeatureXform = FTransform(FQuat::Identity, Center, FVector(0.85f, 0.85f, 1.6f));
+			Out.bHasFeature = true;
+			break;
+
+		case ECellType::Goldmine:
+			// Low wide block per cell (2x2 cells form the full mine).
+			Center.Z += 40.f;
+			Out.FeatureHism = MineInstances;
+			Out.FeatureXform = FTransform(FQuat::Identity, Center, FVector(1.4f, 1.4f, 0.8f));
+			Out.bHasFeature = true;
+			break;
+
+		case ECellType::MerchantShop:
+			// Tent: squat cone per cell.
+			Center.Z += 90.f;
+			Out.FeatureHism = TentInstances;
+			Out.FeatureXform = FTransform(FQuat::Identity, Center, FVector(1.5f, 1.5f, 1.8f));
+			Out.bHasFeature = true;
+			break;
+
+		default:
+			break; // Wall/Tower are player-built (Phase 3/4)
+		}
+	}
+
+	return Out;
+}
+
+void AKodoMapBootstrapper::BuildVisuals(UKodoGridSubsystem& Grid)
+{
+	// Accumulate every instance's world-space transform per HISM (plus the owning cell, in a
+	// parallel array) during the cell loop, then add them all at once after the loop. A single
+	// AddInstances() rebuilds each cluster tree ONCE (vs. one rebuild per AddInstance), which is
+	// what made each editor edit freeze the game. The parallel cell arrays let us populate the
+	// stable CellToInst maps so the incremental UpdateCellVisual path works after a full build.
+	TArray<FTransform> CliffXf;      TArray<FIntPoint> CliffCells;
+	TArray<FTransform> TreeXf;       TArray<FIntPoint> TreeCells;
+	TArray<FTransform> MineXf;       TArray<FIntPoint> MineCells;
+	TArray<FTransform> TentXf;       TArray<FIntPoint> TentCells;
+	TArray<FTransform> GrassToneXf;  TArray<FIntPoint> GrassToneCells; // ramp wedges + interior platform blocks
+
+	const auto Accumulate = [&](UHierarchicalInstancedStaticMeshComponent* Hism, const FTransform& Xf, const FIntPoint& C)
+	{
+		if (Hism == CliffInstances)          { CliffXf.Add(Xf);      CliffCells.Add(C); }
+		else if (Hism == TreeInstances)      { TreeXf.Add(Xf);       TreeCells.Add(C); }
+		else if (Hism == MineInstances)      { MineXf.Add(Xf);       MineCells.Add(C); }
+		else if (Hism == TentInstances)      { TentXf.Add(Xf);       TentCells.Add(C); }
+		else if (Hism == GrassToneInstances) { GrassToneXf.Add(Xf);  GrassToneCells.Add(C); }
+	};
 
 	for (int32 X = 0; X < Grid.GetCols(); ++X)
 	{
 		for (int32 Y = 0; Y < Grid.GetRows(); ++Y)
 		{
 			const FIntPoint Coord(X, Y);
-
-			const float ElevZ = Grid.GetElevationZ(Coord);
-			const int32 Lvl = Grid.GetElevationLevel(Coord);
-			const bool bRamp = Grid.IsRamp(Coord);
-			const FGridCell& State = Grid.GetCell(Coord);
-			const bool bRidge = State.Type == ECellType::Cliff;
-
-			// Highest-elevation 4-neighbour drives the ridge wall height.
-			int32 HiNbrLvl = 0;
-			{
-				const int32 NDx[4] = { 1, -1, 0, 0 };
-				const int32 NDy[4] = { 0, 0, 1, -1 };
-				for (int32 d = 0; d < 4; ++d)
-				{
-					HiNbrLvl = FMath::Max(HiNbrLvl, Grid.GetElevationLevel(FIntPoint(X + NDx[d], Y + NDy[d])));
-				}
-			}
-
-			// --- Raised terrain rendering ---
-			if (bRidge)
-			{
-				// A ridge IS the edge of the upper ground: a tall cliff wall rising from the
-				// lower ground (Z=0) to the upper-ground top plus a rim lip, so the height
-				// reads clearly as the boundary of the plateau even when zoomed out.
-				const int32 EdgeLvl = FMath::Max(FMath::Max(Lvl, HiNbrLvl), 1);
-				const float WallTop = EdgeLvl * Step + 45.f; // +lip: rim stands above the platform
-				FVector C = Grid.CellToWorldCenter(Coord);
-				C.Z = WallTop * 0.5f;
-				CliffInstances->AddInstance(
-					FTransform(FQuat::Identity, C, FVector(Cell / 100.f, Cell / 100.f, WallTop / 100.f)), /*bWorldSpace*/ true);
-			}
-			else if (bRamp)
-			{
-				// Directional ramp (editor-authored dir). Walk the ascent axis to find this cell's
-				// place in the run, then build one continuous slope so a 2-cell run = a 2-cell ramp,
-				// axis-aligned to the chosen direction. The slope's edge heights are stored on the
-				// grid so units/buildings ride the angle (continuous, no sinking).
-				const int32 Dir = FMath::Max(0, Grid.GetRampDir(Coord));
-				const int32 DXs[4] = { 1, -1, 0, 0 };
-				const int32 DYs[4] = { 0, 0, 1, -1 };
-				const int32 ddx = DXs[Dir], ddy = DYs[Dir];
-
-				int32 Below = 0; // ramp cells toward the lower ground (-dir)
-				for (FIntPoint c(Coord.X - ddx, Coord.Y - ddy); Grid.IsRamp(c); c = FIntPoint(c.X - ddx, c.Y - ddy)) { ++Below; }
-				int32 Above = 0; // ramp cells toward the plateau (+dir)
-				FIntPoint Top = Coord;
-				for (FIntPoint c(Coord.X + ddx, Coord.Y + ddy); Grid.IsRamp(c); c = FIntPoint(c.X + ddx, c.Y + ddy)) { ++Above; Top = c; }
-				const int32 RunLen = Below + Above + 1;
-
-				// Plateau height the ramp climbs to = the level just past the top of the run.
-				const FIntPoint Beyond(Top.X + ddx, Top.Y + ddy);
-				int32 PlLvl = Grid.GetElevationLevel(Beyond);
-				if (PlLvl <= 0) { PlLvl = FMath::Max(1, Grid.GetElevationLevel(FIntPoint(Beyond.X + ddx, Beyond.Y + ddy))); }
-				const float RisePerCell = (PlLvl * Step) / RunLen;
-				const float BotZ = Below * RisePerCell;           // low (-dir) edge of this cell
-				const float TopZ = (Below + 1) * RisePerCell;      // high (+dir) edge of this cell
-				Grid.SetRampSlope(Coord, BotZ, TopZ);              // units/buildings ride this
-
-				if (TopZ - BotZ > 0.5f)
-				{
-					const float Rise = TopZ - BotZ;
-					const float SlopeLen = FMath::Sqrt(Cell * Cell + Rise * Rise);
-					const float PitchDeg = FMath::RadiansToDegrees(FMath::Atan2(Rise, Cell)); // +X end up
-					const float YawDeg = (Dir == 0) ? 0.f : (Dir == 1) ? 180.f : (Dir == 2) ? 90.f : 270.f;
-					FVector C = Grid.CellToWorldCenter(Coord);
-					C.Z = 0.5f * (BotZ + TopZ);
-					const FRotator Rot(PitchDeg, YawDeg, 0.f);
-					GrassToneInstances->AddInstance(
-						FTransform(Rot.Quaternion(), C, FVector(SlopeLen / 100.f, Cell / 100.f, 0.40f)), /*bWorldSpace*/ true);
-				}
-			}
-			else if (Lvl >= 1)
-			{
-				// Interior upper ground: a solid platform block whose sides are the cliff faces.
-				FVector C = Grid.CellToWorldCenter(Coord);
-				C.Z = ElevZ * 0.5f;
-				GrassToneInstances->AddInstance(
-					FTransform(FQuat::Identity, C, FVector(Cell / 100.f, Cell / 100.f, ElevZ / 100.f)), /*bWorldSpace*/ true);
-			}
-
-			if (State.Type == ECellType::Empty)
-			{
-				continue;
-			}
-
-			FVector Center = Grid.CellToWorldCenter(Coord);
-			// Trees/mines/merchant sit on top of the raised ground (0 for ground-level cells).
-			Center.Z += ElevZ;
-
-			switch (State.Type)
-			{
-			case ECellType::Cliff:
-				break; // rendered above as the tall cliff-edge wall
-
-			case ECellType::Tree:
-				// Shorter, slimmer cone (~1.6 m) so forests don't dominate the top-down read.
-				Center.Z += 80.f;
-				TreeInstances->AddInstance(FTransform(FQuat::Identity, Center, FVector(0.85f, 0.85f, 1.6f)), true);
-				break;
-
-			case ECellType::Goldmine:
-				// Low wide block per cell (2x2 cells form the full mine).
-				Center.Z += 40.f;
-				MineInstances->AddInstance(FTransform(FQuat::Identity, Center, FVector(1.4f, 1.4f, 0.8f)), true);
-				break;
-
-			case ECellType::MerchantShop:
-				// Tent: squat cone per cell.
-				Center.Z += 90.f;
-				TentInstances->AddInstance(FTransform(FQuat::Identity, Center, FVector(1.5f, 1.5f, 1.8f)), true);
-				break;
-
-			default:
-				break; // Wall/Tower are player-built (Phase 3/4)
-			}
+			const FCellRender R = EvaluateCell(Grid, Coord);
+			if (R.bHasGround)  { Accumulate(R.GroundHism, R.GroundXform, Coord); }
+			if (R.bHasFeature) { Accumulate(R.FeatureHism, R.FeatureXform, Coord); }
 		}
 	}
+
+	// Batched commit + map population: one AddInstances per HISM (transforms are world-space,
+	// matching the old per-instance AddInstance(..., bWorldSpace=true)). After adding, record each
+	// instance's slot index in CellToInst (slots are appended in order, so index i == cell i) and
+	// clear the free-list — the maps now describe every live instance for incremental updates.
+	const auto Commit = [](UHierarchicalInstancedStaticMeshComponent* Hism, const TArray<FTransform>& Xf,
+	                       const TArray<FIntPoint>& Cells, TMap<FIntPoint, int32>& CellToInst, TArray<int32>& FreeSlots)
+	{
+		CellToInst.Reset();
+		FreeSlots.Reset();
+		if (Hism && Xf.Num() > 0)
+		{
+			Hism->AddInstances(Xf, /*bShouldReturnIndices*/ false, /*bWorldSpace*/ true);
+			for (int32 i = 0; i < Cells.Num(); ++i)
+			{
+				CellToInst.Add(Cells[i], i);
+			}
+		}
+	};
+	Commit(CliffInstances, CliffXf, CliffCells, CliffCellToInst, CliffFreeSlots);
+	Commit(TreeInstances, TreeXf, TreeCells, TreeCellToInst, TreeFreeSlots);
+	Commit(MineInstances, MineXf, MineCells, MineCellToInst, MineFreeSlots);
+	Commit(TentInstances, TentXf, TentCells, TentCellToInst, TentFreeSlots);
+	Commit(GrassToneInstances, GrassToneXf, GrassToneCells, GrassToneCellToInst, GrassToneFreeSlots);
 
 	// Tint the raised ground (platforms + ramps) a touch lighter than the lower ground so the
 	// plateau reads as distinct, raised terrain even from a top-down angle.
 	const FLinearColor UpperGround = FMath::Lerp(Grid.GetMapColor(EKodoMapColor::Ground), FLinearColor::White, 0.18f);
 	TintComponent(GrassToneInstances, UpperGround);
+}
+
+void AKodoMapBootstrapper::SetSlot(UHierarchicalInstancedStaticMeshComponent* Hism, TMap<FIntPoint, int32>& CellToInst,
+                                   TArray<int32>& FreeSlots, const FIntPoint& Cell, const FTransform& Xform)
+{
+	if (!Hism)
+	{
+		return;
+	}
+	if (const int32* Existing = CellToInst.Find(Cell))
+	{
+		// Cell already has a slot — update it in place (world space, mark dirty, teleport so there's no interp).
+		Hism->UpdateInstanceTransform(*Existing, Xform, /*bWorldSpace*/ true, /*bMarkRenderStateDirty*/ true, /*bTeleport*/ true);
+		return;
+	}
+	if (FreeSlots.Num() > 0)
+	{
+		// Recycle a previously hidden slot.
+		const int32 Slot = FreeSlots.Pop(EAllowShrinking::No);
+		Hism->UpdateInstanceTransform(Slot, Xform, /*bWorldSpace*/ true, /*bMarkRenderStateDirty*/ true, /*bTeleport*/ true);
+		CellToInst.Add(Cell, Slot);
+		return;
+	}
+	// No free slot — append a new instance (its index is stable for the HISM's lifetime).
+	const int32 NewIdx = Hism->AddInstance(Xform, /*bWorldSpace*/ true);
+	CellToInst.Add(Cell, NewIdx);
+}
+
+void AKodoMapBootstrapper::ClearSlot(UHierarchicalInstancedStaticMeshComponent* Hism, TMap<FIntPoint, int32>& CellToInst,
+                                     TArray<int32>& FreeSlots, const FIntPoint& Cell)
+{
+	if (!Hism)
+	{
+		return;
+	}
+	if (const int32* Existing = CellToInst.Find(Cell))
+	{
+		const int32 Idx = *Existing;
+		// NEVER RemoveInstance (it shifts every later index and corrupts the maps). Instead hide the
+		// instance far below the world at a degenerate scale, and return its slot to the free-list.
+		const FTransform Hidden(FQuat::Identity, FVector(0.f, 0.f, -100000.f), FVector(0.0001f));
+		Hism->UpdateInstanceTransform(Idx, Hidden, /*bWorldSpace*/ true, /*bMarkRenderStateDirty*/ true, /*bTeleport*/ true);
+		FreeSlots.Add(Idx);
+		CellToInst.Remove(Cell);
+	}
+}
+
+void AKodoMapBootstrapper::UpdateCellVisual(UKodoGridSubsystem& Grid, const FIntPoint& Cell)
+{
+	const FCellRender R = EvaluateCell(Grid, Cell);
+
+	// GROUND: a cell holds at most one ground slot (Cliff OR GrassTone). Set it on the applicable
+	// HISM and clear it on the other so a cell that changed ground type doesn't leave a stale body.
+	if (R.bHasGround && R.GroundHism == CliffInstances)
+	{
+		SetSlot(CliffInstances, CliffCellToInst, CliffFreeSlots, Cell, R.GroundXform);
+		ClearSlot(GrassToneInstances, GrassToneCellToInst, GrassToneFreeSlots, Cell);
+	}
+	else if (R.bHasGround && R.GroundHism == GrassToneInstances)
+	{
+		SetSlot(GrassToneInstances, GrassToneCellToInst, GrassToneFreeSlots, Cell, R.GroundXform);
+		ClearSlot(CliffInstances, CliffCellToInst, CliffFreeSlots, Cell);
+	}
+	else
+	{
+		ClearSlot(CliffInstances, CliffCellToInst, CliffFreeSlots, Cell);
+		ClearSlot(GrassToneInstances, GrassToneCellToInst, GrassToneFreeSlots, Cell);
+	}
+
+	// FEATURE: a cell holds at most one feature slot (Tree/Mine/Tent). Set it on the applicable
+	// HISM and clear it on the other two.
+	if (R.bHasFeature && R.FeatureHism == TreeInstances)
+	{
+		SetSlot(TreeInstances, TreeCellToInst, TreeFreeSlots, Cell, R.FeatureXform);
+		ClearSlot(MineInstances, MineCellToInst, MineFreeSlots, Cell);
+		ClearSlot(TentInstances, TentCellToInst, TentFreeSlots, Cell);
+	}
+	else if (R.bHasFeature && R.FeatureHism == MineInstances)
+	{
+		SetSlot(MineInstances, MineCellToInst, MineFreeSlots, Cell, R.FeatureXform);
+		ClearSlot(TreeInstances, TreeCellToInst, TreeFreeSlots, Cell);
+		ClearSlot(TentInstances, TentCellToInst, TentFreeSlots, Cell);
+	}
+	else if (R.bHasFeature && R.FeatureHism == TentInstances)
+	{
+		SetSlot(TentInstances, TentCellToInst, TentFreeSlots, Cell, R.FeatureXform);
+		ClearSlot(TreeInstances, TreeCellToInst, TreeFreeSlots, Cell);
+		ClearSlot(MineInstances, MineCellToInst, MineFreeSlots, Cell);
+	}
+	else
+	{
+		ClearSlot(TreeInstances, TreeCellToInst, TreeFreeSlots, Cell);
+		ClearSlot(MineInstances, MineCellToInst, MineFreeSlots, Cell);
+		ClearSlot(TentInstances, TentCellToInst, TentFreeSlots, Cell);
+	}
+}
+
+void AKodoMapBootstrapper::UpdateCellRegion(UKodoGridSubsystem& Grid, const FIntPoint& Center)
+{
+	// The edited cell plus its 8 neighbors — a ridge wall's height (highest 4-neighbour level) and
+	// a ramp's slope (run length from neighbors) depend on adjacent cells, so they re-evaluate too.
+	for (int32 Dx = -1; Dx <= 1; ++Dx)
+	{
+		for (int32 Dy = -1; Dy <= 1; ++Dy)
+		{
+			const FIntPoint C(Center.X + Dx, Center.Y + Dy);
+			if (Grid.IsInBounds(C))
+			{
+				UpdateCellVisual(Grid, C);
+			}
+		}
+	}
+}
+
+bool AKodoMapBootstrapper::SaveLayoutToFile(const UKodoGridSubsystem& Grid) const
+{
+	// Serialize the CURRENT live grid back to the map file in the EXACT format
+	// LoadLayoutFromFile parses (so an editor edit round-trips). Lines are grouped in the
+	// same order the file currently uses: header, COLOR*, spawns, E*, RAMP*, G*, C*, T*.
+	const int32 Cols = Grid.GetCols();
+	const int32 Rows = Grid.GetRows();
+
+	// Linear -> sRGB FColor (ToFColor(true)) is the inverse of the loader's
+	// FLinearColor::FromSRGBColor(FColor), so colors round-trip.
+	const auto HexOf = [&Grid](EKodoMapColor Which) -> FString
+	{
+		const FColor C = Grid.GetMapColor(Which).ToFColor(/*bSRGB*/ true);
+		return FString::Printf(TEXT("%02x%02x%02x"), C.R, C.G, C.B);
+	};
+
+	TArray<FString> Lines;
+
+	// Header: "KODOMAP <Cols> <Rows>". We don't persist a WALL edge flag (no grid getter
+	// exposes it), so omit it — the loader treats its absence as "no edge wall".
+	Lines.Add(FString::Printf(TEXT("KODOMAP %d %d"), Cols, Rows));
+
+	// COLOR <name> <rrggbb> — names must match the loader's ResolveMapColorName.
+	Lines.Add(FString::Printf(TEXT("COLOR ridge %s"),  *HexOf(EKodoMapColor::Ridge)));
+	Lines.Add(FString::Printf(TEXT("COLOR tree %s"),   *HexOf(EKodoMapColor::Tree)));
+	Lines.Add(FString::Printf(TEXT("COLOR mine %s"),   *HexOf(EKodoMapColor::Mine)));
+	Lines.Add(FString::Printf(TEXT("COLOR wall %s"),   *HexOf(EKodoMapColor::Wall)));
+	Lines.Add(FString::Printf(TEXT("COLOR cc %s"),     *HexOf(EKodoMapColor::CommandCenter)));
+	Lines.Add(FString::Printf(TEXT("COLOR hero %s"),   *HexOf(EKodoMapColor::Hero)));
+	Lines.Add(FString::Printf(TEXT("COLOR kodo %s"),   *HexOf(EKodoMapColor::Kodo)));
+	Lines.Add(FString::Printf(TEXT("COLOR ground %s"), *HexOf(EKodoMapColor::Ground)));
+
+	// Spawn + merchant master cells.
+	const FIntPoint KSpawn = Grid.GetKodoSpawnCell();
+	const FIntPoint RSpawn = Grid.GetRunnerSpawnCell();
+	const FIntPoint Merchant = Grid.GetMerchantCell();
+	Lines.Add(FString::Printf(TEXT("KSPAWN %d %d"), KSpawn.X, KSpawn.Y));
+	Lines.Add(FString::Printf(TEXT("RSPAWN %d %d"), RSpawn.X, RSpawn.Y));
+	Lines.Add(FString::Printf(TEXT("MERCHANT %d %d"), Merchant.X, Merchant.Y));
+
+	// Collect terrain lines into separate buckets so they emit in the canonical group order.
+	TArray<FString> ElevLines;
+	TArray<FString> RampLines;
+	TArray<FString> MineLines;
+	TArray<FString> CliffLines;
+	TArray<FString> TreeLines;
+
+	for (int32 X = 0; X < Cols; ++X)
+	{
+		for (int32 Y = 0; Y < Rows; ++Y)
+		{
+			const FIntPoint Coord(X, Y);
+
+			// Raised-base elevation (E x y level) — only persisted when raised.
+			const int32 Level = Grid.GetElevationLevel(Coord);
+			if (Level >= 1)
+			{
+				ElevLines.Add(FString::Printf(TEXT("E %d %d %d"), X, Y, Level));
+			}
+
+			// Walkable ramp (RAMP x y DIR) — DIR letter from GetRampDir (0=E 1=W 2=S 3=N).
+			if (Grid.IsRamp(Coord))
+			{
+				const int32 Dir = Grid.GetRampDir(Coord);
+				const TCHAR DirLetter = (Dir == 0) ? TEXT('E') : (Dir == 1) ? TEXT('W')
+				                      : (Dir == 2) ? TEXT('S') : TEXT('N'); // 3 or fallback => N
+				RampLines.Add(FString::Printf(TEXT("RAMP %d %d %c"), X, Y, DirLetter));
+			}
+
+			// Terrain cell types: only C/T/G are saved map terrain (Wall/Tower/MerchantShop/
+			// Empty are player-built or runtime, matching what LoadLayoutFromFile expects).
+			const FGridCell& State = Grid.GetCell(Coord);
+			switch (State.Type)
+			{
+			case ECellType::Cliff:
+				CliffLines.Add(FString::Printf(TEXT("C %d %d"), X, Y));
+				break;
+			case ECellType::Tree:
+				TreeLines.Add(FString::Printf(TEXT("T %d %d"), X, Y));
+				break;
+			case ECellType::Goldmine:
+			{
+				// G x y mx my — the mine's 2x2 master cell; fall back to x,y if unset (-1,-1).
+				const FIntPoint Master = (State.MasterCell.X >= 0 && State.MasterCell.Y >= 0)
+				                       ? State.MasterCell : Coord;
+				MineLines.Add(FString::Printf(TEXT("G %d %d %d %d"), X, Y, Master.X, Master.Y));
+				break;
+			}
+			default:
+				break; // Empty / Wall / Tower / MerchantShop — not saved terrain.
+			}
+		}
+	}
+
+	Lines.Append(ElevLines);
+	Lines.Append(RampLines);
+	Lines.Append(MineLines);
+	Lines.Append(CliffLines);
+	Lines.Append(TreeLines);
+
+	const FString Path = FPaths::ProjectContentDir() / TEXT("Config/KodoMapLayout.txt");
+	const FString Contents = FString::Join(Lines, TEXT("\n")) + TEXT("\n");
+	if (!FFileHelper::SaveStringToFile(Contents, *Path))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[KodoMap] Failed to save layout to %s"), *Path);
+		return false;
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("[KodoMap] Saved layout (%d lines) to %s"), Lines.Num(), *Path);
+	return true;
+}
+
+void AKodoMapBootstrapper::RebuildTerrainVisuals(UKodoGridSubsystem& Grid)
+{
+	// Drop all blockout terrain instances, then re-add + re-tint from the current grid.
+	// (Player-built Wall/Tower structures live on the StructureManager via OnCellChanged
+	// and are NOT touched here.) BuildVisuals only AddInstance/SetRampSlope/Tint, so a
+	// clear-then-build is safe to repeat.
+	if (CliffInstances)      { CliffInstances->ClearInstances(); }
+	if (TreeInstances)       { TreeInstances->ClearInstances(); }
+	if (MineInstances)       { MineInstances->ClearInstances(); }
+	if (TentInstances)       { TentInstances->ClearInstances(); }
+	if (GrassToneInstances)  { GrassToneInstances->ClearInstances(); }
+
+	// The HISMs are now empty, so the stable-slot bookkeeping must be reset too — BuildVisuals
+	// repopulates CellToInst from scratch (and Commit() clears the free-lists). Reset here as well
+	// so a HISM that ends up with zero instances still has empty maps/free-lists.
+	CliffCellToInst.Reset();     CliffFreeSlots.Reset();
+	TreeCellToInst.Reset();      TreeFreeSlots.Reset();
+	MineCellToInst.Reset();      MineFreeSlots.Reset();
+	TentCellToInst.Reset();      TentFreeSlots.Reset();
+	GrassToneCellToInst.Reset(); GrassToneFreeSlots.Reset();
+
+	BuildVisuals(Grid);
 }

@@ -93,6 +93,17 @@ void UKodoGridSubsystem::SetRamp(const FIntPoint& Cell, const int32 Dir)
 	RampDir[Idx] = static_cast<int8>(FMath::Clamp(Dir, 0, 3)); // 0=E 1=W 2=S 3=N (ascent dir)
 }
 
+void UKodoGridSubsystem::ClearRamp(const FIntPoint& Cell)
+{
+	if (!IsInBounds(Cell))
+	{
+		return;
+	}
+	const int32 Idx = KodoGrid::CellIndex(Cell.X, Cell.Y, Cols);
+	RampCell[Idx] = 0;
+	RampDir[Idx] = static_cast<int8>(-1);
+}
+
 int32 UKodoGridSubsystem::GetElevationLevel(const FIntPoint& Cell) const
 {
 	if (!IsInBounds(Cell))
@@ -302,11 +313,20 @@ void UKodoGridSubsystem::EnsureFlowField(const FIntPoint& Target)
 	{
 		return;
 	}
+	// Throttle: the full-grid Dijkstra (x2) is the heaviest tick cost on the big 300x300 map, and
+	// it would otherwise fire every frame while the runner moves or Kodos chew walls. Cap it to a
+	// min interval; Kodos repath every ~0.35-0.6 s, so a field up to ~0.2 s stale is unnoticeable.
+	const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.f;
+	if (Field1Dist.Num() == Cols * Rows && (Now - LastFlowComputeTime) < 0.2f)
+	{
+		return; // reuse the (slightly stale) cached fields until the interval elapses
+	}
 	Pathfinder->ComputeDistanceField(Cells, Target, 1, Field1Dist, Field1Next);
 	Pathfinder->ComputeDistanceField(Cells, Target, 2, Field2Dist, Field2Next);
 	FlowTarget = Target;
 	bFlowDirty = false;
 	FlowComputeFrame = GFrameCounter;
+	LastFlowComputeTime = Now;
 }
 
 bool UKodoGridSubsystem::IsFieldReachable(const int32 Size, const FIntPoint& Cell) const

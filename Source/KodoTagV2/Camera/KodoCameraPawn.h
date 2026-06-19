@@ -32,6 +32,9 @@ public:
 	/** Spacebar: re-lock follow on the Runner (game.js:3045-3048). */
 	void LockToTarget();
 
+	/** Set the follow-lock directly (map editor: false = free-scroll, no hero follow). */
+	void SetLocked(bool bLocked) { bCameraLocked = bLocked; }
+
 	void SetFollowTarget(AActor* Target);
 
 	/** Minimap click/drag: jump the focus point to a world XY position (unlocks follow). */

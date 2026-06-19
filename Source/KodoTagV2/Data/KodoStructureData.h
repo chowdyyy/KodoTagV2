@@ -51,8 +51,11 @@ struct FKodoStructurePreset
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Kodo") FName Special;
 	/** CC research flag gating this preset ('stunUnlocked', ...), None if always available. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Kodo") FName RequiresUpgrade;
-	/** CC, lumber_mill, mine_shaft occupy 2x2 (game.js:1926). */
+	/** CC, lumber_mill, mine_shaft occupy 2x2 (game.js:1926). Kept as the "multi-cell?" shorthand
+	 *  (true once FootprintSize >= 2); FootprintSize is the real N x N footprint extent. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Kodo") bool bIs2x2 = false;
+	/** Footprint extent in cells: 1 = 1x1, 2 = 2x2 (walls/towers/economy), 4 = 4x4 (CC/upgrade/war_altar). */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Kodo") int32 FootprintSize = 1;
 	/** Walls 2.5 s, everything else 4.0 s (game.js:1971/1996). */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Kodo") float ConstructionSeconds = 4.f;
 

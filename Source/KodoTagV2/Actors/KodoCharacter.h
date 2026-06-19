@@ -13,6 +13,7 @@ class AKodoWaveController;
 class ARunnerCharacter;
 class UWidgetComponent;
 class UKodoHealthBarWidget;
+class UStaticMeshComponent;
 
 /** entities.js:744 — 'standard', 'speed', 'tank', 'blink'. */
 UENUM(BlueprintType)
@@ -82,6 +83,16 @@ protected:
 	void UpdateEnrageVisual(bool bEnraged);
 	ARunnerCharacter* ResolveRunner();
 
+	/**
+	 * Smooth the actor's yaw toward the facing the base movement/chew code just snapped it to.
+	 * Called right after StepAlongPath / the wall-face SetActorRotation: it reads the snapped
+	 * yaw as the target, interpolates CurrentYaw toward it (RInterpTo, yaw only), and re-applies
+	 * the smoothed rotation so the body swings to face its heading instead of popping. Does NOT
+	 * touch path math or speed — rotation only. When not moving the base leaves the yaw alone, so
+	 * the target equals the current facing and this is a no-op (keeps last facing).
+	 */
+	void SmoothFacingToActorYaw(float DeltaSeconds);
+
 	/** Refresh the overhead bar; only touches the widget when the fraction actually changes. */
 	void UpdateHealthBar();
 
@@ -135,12 +146,36 @@ protected:
 	// Wall chewing (entities.js:1027-1039)
 	float AttackCooldown = 0.f;
 
+	/** Periodic runner-bite cooldown (combat viability). Contact deals a moderate, survivable
+	 *  bite on this cadence instead of the old per-frame lethal hit. Ticked down each Tick. */
+	float BiteCooldown = 0.f;
+
 	// Blink (entities.js:784-786, 960-983)
 	float BlinkTimer = 0.f;
 	float BlinkCooldownSeconds = 5.f;
 
 	bool bEnragedVisualActive = false;
 	FVector BaseBodyScale = FVector::OneVector;
+
+	/**
+	 * Smoothed top-down facing. The base StepAlongPath SNAPS the actor yaw to the
+	 * movement direction every frame; we capture that as a target and interpolate the
+	 * actual actor yaw toward it (FMath::RInterpTo on yaw only) so the body swings to
+	 * face where it's heading instead of popping. Skipped when not moving (keeps last
+	 * facing) and not applied while chewing (the attack code aims at the wall directly).
+	 */
+	float CurrentYaw = 0.f;
+	bool bFacingInit = false;
+
+	/**
+	 * Front "snout/head" indicator. A small cone offset along +X (the actor forward axis,
+	 * since yaw faces +X) marks which way the kodo is heading from the top-down camera.
+	 * Child of BodyMesh so it inherits the body's rotation/scale and always sits on the
+	 * front. Contrasting (darkened) tint, no shadow, no collision — matches the top-down
+	 * blockout style. Built per-kodo in InitKodo.
+	 */
+	UPROPERTY(VisibleAnywhere, Category = "Kodo")
+	TObjectPtr<UStaticMeshComponent> SnoutMesh;
 
 	// Code-driven blockout animations (Phase 5; replaced by AnimBP montages with real meshes).
 	bool bDying = false;

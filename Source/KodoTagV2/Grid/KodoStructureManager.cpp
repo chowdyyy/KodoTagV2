@@ -150,10 +150,12 @@ FIntPoint AKodoStructureManager::ComputeBuildOrigin(const FIntPoint& Cell, const
 	{
 		return Grid->GetMasterCell(Cell);
 	}
-	// 2x2 buildings place with their top-left at the EXACT cursor cell (1-cell granularity)
-	// instead of snapping to the coarse even 2x2 lattice. This lets the player set a Command
-	// Center / mine shaft / lumber mill directly adjacent to 1x1 things (trees, walls) with
-	// no forced gap. The 2x2 footprint + per-cell CanBuildAt validation are unchanged.
+	// 2x2 buildings place their top-left at the EXACT cursor cell (1-cell granularity). This is
+	// the heart of the maze: two 2x2 walls can be GLUED flush (no gap), or left a MINIMUM 1-cell
+	// gap — wide enough for the 1-cell player + Speed Kodos to slip through, but NOT the 2-cell big
+	// Kodos (footprint-aware pathing blocks a size-2 unit from a 1-wide corridor). An even-lattice
+	// snap was tried but it forced gaps to be 0 or 2 cells (a 2-cell gap lets big Kodos through), so
+	// it's removed — alignment is now the player's choice (the build ghost previews the exact cell).
 	return Cell;
 }
 
@@ -181,10 +183,10 @@ bool AKodoStructureManager::PlaceStructure(const FName PresetId, const FIntPoint
 		return false;
 	}
 
-	// Footprint validation (game.js:1926-1944). 2x2 buildings place at the exact cursor
-	// cell (ComputeBuildOrigin no longer snaps to the coarse lattice), so they can sit
-	// tightly adjacent to 1x1 trees/walls; every footprint cell is still validated below.
-	const int32 Footprint = Preset->bIs2x2 ? 2 : 1;
+	// Footprint validation (game.js:1926-1944). ComputeBuildOrigin resolves the top-left:
+	// barriers (walls + towers) snap to the even 2x2 lattice (flush maze, no Kodo shortcut),
+	// economy/tech buildings keep exact-cursor placement; every footprint cell is validated below.
+	const int32 Footprint = Preset->FootprintSize;
 	const FIntPoint Origin = ComputeBuildOrigin(Cell, PresetId);
 	for (int32 Dx = 0; Dx < Footprint; ++Dx)
 	{
@@ -193,7 +195,7 @@ bool AKodoStructureManager::PlaceStructure(const FName PresetId, const FIntPoint
 			const FIntPoint Test(Origin.X + Dx, Origin.Y + Dy);
 			if (!Grid->IsInBounds(Test) || !CanBuildAt(Test, PresetId))
 			{
-				ShowMessage(Preset->bIs2x2 ? TEXT("Invalid 2x2 build location!") : TEXT("Invalid build location!"),
+				ShowMessage(Preset->bIs2x2 ? TEXT("Invalid multi-cell build location!") : TEXT("Invalid build location!"),
 				            FColor::Red);
 				return false;
 			}
@@ -256,6 +258,7 @@ namespace
 		case EKodoResearch::Masonry:    Gold = 120.f; Wood =  60.f; Seconds = 18.f; break;
 		case EKodoResearch::Axe:        Gold =  80.f; Wood =  30.f; Seconds = 15.f; break;
 		case EKodoResearch::GoldBonus:  Gold = 100.f; Wood =  40.f; Seconds = 18.f; break;
+		case EKodoResearch::MagicWall:  Gold = 150.f; Wood = 100.f; Seconds = 25.f; break;
 		case EKodoResearch::HeroSkill2: Gold = 120.f; Wood =  60.f; Seconds = 25.f; break;
 		case EKodoResearch::HeroSkill3: Gold = 200.f; Wood = 100.f; Seconds = 35.f; break;
 		case EKodoResearch::ManaRegen:  Gold = 200.f; Wood =   0.f; Seconds = 20.f; break;
@@ -273,6 +276,7 @@ namespace
 		case EKodoResearch::Masonry:    return TEXT("Masonry");
 		case EKodoResearch::Axe:        return TEXT("Lumber Axes");
 		case EKodoResearch::GoldBonus:  return TEXT("Gold Bonus");
+		case EKodoResearch::MagicWall:  return TEXT("Magic Wall");
 		case EKodoResearch::HeroSkill2: return TEXT("Hero Skill 2");
 		case EKodoResearch::ManaRegen:  return TEXT("Mana Regen");
 		default:                        return TEXT("Hero Skill 3");
@@ -313,6 +317,37 @@ float AKodoStructureManager::GetResearchProgress(const EKodoResearch Type, float
 		}
 	}
 	return -1.f; // this type isn't currently researching
+}
+
+bool AKodoStructureManager::GetResearchStatus(const EKodoResearch Type, FString& OutName, float& OutFrac, float& OutRemaining, float& OutTotal) const
+{
+	for (const FActiveResearch& R : ActiveResearches)
+	{
+		if (R.Type == Type)
+		{
+			OutName = ResearchName(Type);
+			OutRemaining = R.TimeRemaining;
+			OutTotal = R.TotalTime;
+			OutFrac = R.TotalTime > 0.f ? (R.TotalTime - R.TimeRemaining) / R.TotalTime : 0.f; // elapsed fraction 0..1
+			return true;
+		}
+	}
+	return false; // this type isn't currently researching
+}
+
+bool AKodoStructureManager::GetConstructionProgress(const FIntPoint& Cell, float& OutFrac, float& OutRemaining, float& OutTotal) const
+{
+	for (const FConstructionEntry& Entry : Constructions)
+	{
+		if (Entry.Cell == Cell)
+		{
+			OutTotal = Entry.Duration;
+			OutRemaining = FMath::Max(0.f, Entry.Duration - Entry.Elapsed);
+			OutFrac = Entry.Duration > 0.f ? Entry.Elapsed / Entry.Duration : 0.f; // elapsed fraction 0..1
+			return true;
+		}
+	}
+	return false; // this cell isn't under construction
 }
 
 bool AKodoStructureManager::Research(const EKodoResearch Type)
@@ -360,6 +395,7 @@ bool AKodoStructureManager::Research(const EKodoResearch Type)
 	case EKodoResearch::Masonry:   bDone = Up.MasonryLvl >= 3; break;
 	case EKodoResearch::Axe:       bDone = Up.AxeLvl >= 3; break;
 	case EKodoResearch::GoldBonus: bDone = Up.GoldBonusLvl >= 3; break;
+	case EKodoResearch::MagicWall: bDone = Up.bMagicWallUnlocked; break;
 	case EKodoResearch::HeroSkill2:
 	case EKodoResearch::HeroSkill3:
 	{
@@ -414,6 +450,7 @@ void AKodoStructureManager::ApplyResearchEffect(const EKodoResearch Type)
 	case EKodoResearch::Aura:      Up.bAuraUnlocked = true; break;
 	case EKodoResearch::Axe:       Up.AxeLvl = FMath::Min(Up.AxeLvl + 1, 3); break;
 	case EKodoResearch::GoldBonus: Up.GoldBonusLvl = FMath::Min(Up.GoldBonusLvl + 1, 3); break;
+	case EKodoResearch::MagicWall: Up.bMagicWallUnlocked = true; break;
 	case EKodoResearch::Masonry:
 		Up.MasonryLvl = FMath::Min(Up.MasonryLvl + 1, 3);
 		{
@@ -504,35 +541,11 @@ void AKodoStructureManager::Tick(float DeltaSeconds)
 	TickTowerCombat(DeltaSeconds);
 	TickTowerFx(DeltaSeconds);
 
-	// 1c. Death Knight passive: +2 HP/s to all structures except goldmines/trees
-	// (game.js:1328-1342).
-	const ARunnerCharacter* RegenRunner = Cast<ARunnerCharacter>(
-		UGameplayStatics::GetActorOfClass(GetWorld(), ARunnerCharacter::StaticClass()));
-	if (RegenRunner && RegenRunner->GetHeroClass() == EKodoHeroClass::DeathKnight &&
-	    RegenRunner->IsSkill2Unlocked())
-	{
-		DkRegenTimer += DeltaSeconds;
-		if (DkRegenTimer >= 1.f)
-		{
-			DkRegenTimer = 0.f;
-			static const FName GoldmineId(TEXT("goldmine"));
-			static const FName TreeId(TEXT("tree"));
-			for (int32 X = 0; X < Grid->GetCols(); ++X)
-			{
-				for (int32 Y = 0; Y < Grid->GetRows(); ++Y)
-				{
-					const FIntPoint Coord(X, Y);
-					FGridCell Cell = Grid->GetCell(Coord);
-					if (Cell.Type != ECellType::Empty && Cell.StructureId != GoldmineId &&
-					    Cell.StructureId != TreeId && Cell.Hp < Cell.MaxHp)
-					{
-						Cell.Hp = FMath::Min(Cell.MaxHp, Cell.Hp + 2.f);
-						Grid->SetCell(Coord, Cell);
-					}
-				}
-			}
-		}
-	}
+	// 1c. Structure-regen passive: dormant in Pass 1. This was the Death Knight's slot-2 passive
+	// (+2 HP/s to all structures except goldmines/trees, game.js:1328-1342). The Death Knight was
+	// retired in the 6-class hero overhaul; the passive will be re-homed onto a class (and re-enabled)
+	// when the full ability kits land in a later pass. DkRegenTimer is left in place for that work.
+	(void)DkRegenTimer;
 
 	// 2. Passive income, 1 s cadence (game.js:1232-1270).
 	EconomyTick += DeltaSeconds;
@@ -665,10 +678,12 @@ bool AKodoStructureManager::MorphBasicTower(const FIntPoint& Cell, const FName T
 		return false;
 	}
 
-	// Morph replaces the basic tower in place, reusing its own footprint (combat towers
-	// are now 1x1 so they form the maze; the loop below still honors bIs2x2 if it changes).
+	// Morph replaces the basic tower in place, reusing its own master/footprint (the morph targets
+	// — combat towers, lumber_mill, mine_shaft — are all 2x2 like the basic tower, so the footprint
+	// is unchanged; the loop below drives off the target's FootprintSize regardless).
 	const FKodoStructurePreset* TargetPreset = KodoStructures::Find(TargetId);
 	const bool bIs2x2 = TargetPreset && TargetPreset->bIs2x2;
+	const int32 TargetFootprint = TargetPreset ? TargetPreset->FootprintSize : 1;
 
 	GS->Spend(Row->Gold, Row->Wood);
 
@@ -684,7 +699,7 @@ bool AKodoStructureManager::MorphBasicTower(const FIntPoint& Cell, const FName T
 	}
 	const float FinalHp = FMath::RoundToFloat(Stats.MaxHp * HpMult);
 
-	const int32 Footprint = bIs2x2 ? 2 : 1;
+	const int32 Footprint = TargetFootprint;
 	for (int32 Dx = 0; Dx < Footprint; ++Dx)
 	{
 		for (int32 Dy = 0; Dy < Footprint; ++Dy)
@@ -692,7 +707,7 @@ bool AKodoStructureManager::MorphBasicTower(const FIntPoint& Cell, const FName T
 			const FIntPoint Target(Master.X + Dx, Master.Y + Dy);
 			if (!Grid->IsInBounds(Target))
 			{
-				continue; // 2x2 replacements are bounds-checked per cell (game.js:2088)
+				continue; // multi-cell replacements are bounds-checked per cell (game.js:2088)
 			}
 			FGridCell NewCell;
 			NewCell.Type = ECellType::Tower;
@@ -734,6 +749,16 @@ bool AKodoStructureManager::UpgradeStructureTier(const FIntPoint& Cell)
 	}
 
 	const int32 NextLevel = Current.Level + 1;
+
+	// The wall's FINAL tier (the last entry in its Levels, e.g. "Reinforced/Magical Wall") is gated
+	// behind the Magic Wall research at the Command Center. Lower tiers upgrade freely.
+	if (Current.StructureId == FName("wall") && NextLevel >= Preset->Levels.Num() &&
+	    !GS->Upgrades.bMagicWallUnlocked)
+	{
+		ShowMessage(TEXT("Researching Magic Wall at the Command Center unlocks the final wall tier"), FColor::Orange);
+		return false;
+	}
+
 	const FKodoStructureStats NextStats = KodoStructures::GetStatsForLevel(Current.StructureId, NextLevel);
 	// Walls upgrade free in the prototype despite listed costs (game.js:2143) — ported bug-for-bug.
 	const float Cost = Current.StructureId == FName("wall") ? 0.f : NextStats.GoldCost;
@@ -758,10 +783,11 @@ bool AKodoStructureManager::UpgradeStructureTier(const FIntPoint& Cell)
 	const float NewMaxHp = FMath::RoundToFloat(NextStats.MaxHp * HpMult);
 	const float NewHp = FMath::RoundToFloat(NewMaxHp * HpRatio);
 
-	// Bump every footprint cell so a 2x2 building's tier/HP stay in lockstep.
-	for (int32 Dx = 0; Dx <= 1; ++Dx)
+	// Bump every footprint cell so a multi-cell building's tier/HP stay in lockstep.
+	const int32 Footprint = Preset->FootprintSize;
+	for (int32 Dx = 0; Dx < Footprint; ++Dx)
 	{
-		for (int32 Dy = 0; Dy <= 1; ++Dy)
+		for (int32 Dy = 0; Dy < Footprint; ++Dy)
 		{
 			const FIntPoint T(Master.X + Dx, Master.Y + Dy);
 			if (!Grid->IsInBounds(T))
@@ -813,7 +839,33 @@ bool AKodoStructureManager::SellStructure(const FIntPoint& Cell)
 	const float Refund = FMath::FloorToFloat(TotalCost * 0.6f);
 	GS->Gold += Refund;
 
-	Grid->ClearStructure(Master);
+	// Clear the whole footprint. ClearStructure (grid) only sweeps a 2x2 window around the master,
+	// which is enough for 1x1/2x2 buildings but would leave a 4x4 building's outer cells blocked, so
+	// for >2 footprints we explicitly empty every cell that points back at this master.
+	const int32 Footprint = Preset->FootprintSize;
+	if (Footprint > 2)
+	{
+		for (int32 Dx = 0; Dx < Footprint; ++Dx)
+		{
+			for (int32 Dy = 0; Dy < Footprint; ++Dy)
+			{
+				const FIntPoint T(Master.X + Dx, Master.Y + Dy);
+				if (!Grid->IsInBounds(T))
+				{
+					continue;
+				}
+				const FGridCell& C = Grid->GetCell(T);
+				if ((T == Master || C.MasterCell == Master) && C.Type != ECellType::Empty)
+				{
+					Grid->SetCell(T, FGridCell());
+				}
+			}
+		}
+	}
+	else
+	{
+		Grid->ClearStructure(Master);
+	}
 	RecalcAllKodoPaths();
 	ShowMessage(FString::Printf(TEXT("Refunded +%.0fg"), Refund), FColor::Yellow);
 	return true;
@@ -828,6 +880,7 @@ void AKodoStructureManager::TickTowerCombat(const float DeltaSeconds)
 	static const FName LumberMillId(TEXT("lumber_mill"));
 	static const FName UpgradeCenterId(TEXT("upgrade_center"));
 	static const FName AdminTowerId(TEXT("admin_tower"));
+	static const FName WarAltarId(TEXT("war_altar"));
 	static const FName AuraSpecial(TEXT("aura"));
 	static const FName MultishotSpecial(TEXT("multishot"));
 	static const FName StunSpecial(TEXT("stun"));
@@ -865,7 +918,7 @@ void AKodoStructureManager::TickTowerCombat(const float DeltaSeconds)
 			if (Cell.Type != ECellType::Tower || Cell.bUnderConstruction || Cell.MasterCell != Coord ||
 			    Cell.StructureId == CommandCenterId || Cell.StructureId == MineShaftId ||
 			    Cell.StructureId == LumberMillId || Cell.StructureId == UpgradeCenterId ||
-			    Cell.StructureId == AdminTowerId)
+			    Cell.StructureId == AdminTowerId || Cell.StructureId == WarAltarId)
 			{
 				TowerCooldowns.Remove(Coord);
 				It.RemoveCurrent();
@@ -1035,10 +1088,12 @@ void AKodoStructureManager::OnCellChanged(const FIntPoint& Cell, const FGridCell
 	static const FName LumberMillId(TEXT("lumber_mill"));
 	static const FName UpgradeCenterId(TEXT("upgrade_center"));
 	static const FName AdminTowerId(TEXT("admin_tower"));
+	static const FName WarAltarId(TEXT("war_altar"));
 	const bool bActiveTower = NewState.Type == ECellType::Tower && !NewState.bUnderConstruction &&
 		NewState.MasterCell == Cell && NewState.StructureId != CommandCenterId &&
 		NewState.StructureId != MineShaftId && NewState.StructureId != LumberMillId &&
-		NewState.StructureId != UpgradeCenterId && NewState.StructureId != AdminTowerId;
+		NewState.StructureId != UpgradeCenterId && NewState.StructureId != AdminTowerId &&
+		NewState.StructureId != WarAltarId;
 	if (bActiveTower)
 	{
 		ActiveTowerCells.Add(Cell);
@@ -1099,6 +1154,8 @@ FLinearColor AKodoStructureManager::TintForStructure(const FName StructureId) co
 	if (StructureId == FName("magic_wall"))     { return FLinearColor(0.35f, 0.55f, 0.95f); }
 	// Upgrade Center: distinct teal tech building.
 	if (StructureId == FName("upgrade_center")) { return FLinearColor(0.1f, 0.65f, 0.7f); }
+	// War Altar: deep crimson hero-upgrade building.
+	if (StructureId == FName("war_altar"))      { return FLinearColor(0.7f, 0.12f, 0.18f); }
 	// Admin Tower: dark charcoal-red so it reads as the distinct control panel in the corner.
 	if (StructureId == FName("admin_tower"))    { return FLinearColor(0.28f, 0.05f, 0.06f); }
 	// Prototype palette (towers.js icons / projectile colors).
@@ -1116,11 +1173,13 @@ FLinearColor AKodoStructureManager::TintForStructure(const FName StructureId) co
 FVector AKodoStructureManager::BuildingCenter(const FIntPoint& MasterCell, const FName StructureId) const
 {
 	FVector Center = Grid ? Grid->CellToWorldCenter(MasterCell) : FVector::ZeroVector;
-	// 2x2 buildings have their master at the top-left, so nudge to the footprint middle.
-	if (const FKodoStructurePreset* Preset = KodoStructures::Find(StructureId); Preset && Preset->bIs2x2)
+	// Multi-cell buildings have their master at the top-left, so nudge to the footprint middle:
+	// (FootprintSize - 1) * 0.5 cells on X and Y (2x2 -> +0.5 cell, 4x4 -> +1.5 cells).
+	if (const FKodoStructurePreset* Preset = KodoStructures::Find(StructureId); Preset && Preset->FootprintSize > 1)
 	{
-		Center.X += KodoUnits::CellSizeUU * 0.5f;
-		Center.Y += KodoUnits::CellSizeUU * 0.5f;
+		const float Nudge = (Preset->FootprintSize - 1) * 0.5f * KodoUnits::CellSizeUU;
+		Center.X += Nudge;
+		Center.Y += Nudge;
 	}
 	// Sit on the raised/ramped ground (continuous height: angled on ramps, stepped on plateaus).
 	if (Grid)
@@ -1139,7 +1198,8 @@ void AKodoStructureManager::UpdateStructureVisual(const FIntPoint& Cell, const F
 	const bool bIsWall = State.Type == ECellType::Wall;
 	const bool bIsEconomyBuilding = State.StructureId == FName("command_center") ||
 		State.StructureId == FName("lumber_mill") || State.StructureId == FName("mine_shaft") ||
-		State.StructureId == FName("upgrade_center") || State.StructureId == FName("admin_tower");
+		State.StructureId == FName("upgrade_center") || State.StructureId == FName("admin_tower") ||
+		State.StructureId == FName("war_altar");
 	const bool bIsShootingTower = !bIsWall && !bIsEconomyBuilding;
 
 	const FKodoStructurePreset* Preset = KodoStructures::Find(State.StructureId);
@@ -1186,6 +1246,7 @@ void AKodoStructureManager::UpdateStructureVisual(const FIntPoint& Cell, const F
 		UStaticMeshComponent* Head = NewObject<UStaticMeshComponent>(this);
 		Head->SetMobility(EComponentMobility::Movable);
 		Head->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		Head->SetCastShadow(false); // towers cast no shadow (matches the base + cliffs; keeps the top-down read clean)
 		Head->RegisterComponent();
 		Head->AttachToComponent(RootComponent, FAttachmentTransformRules::KeepWorldTransform);
 		Head->SetStaticMesh(CubeMesh.Get());
@@ -1210,8 +1271,11 @@ void AKodoStructureManager::UpdateStructureVisual(const FIntPoint& Cell, const F
 	FVector Location;
 	if (bIsShootingTower)
 	{
-		// One fat cylinder filling the 2x2 footprint, centered over the whole building.
-		const float Width = b2x2 ? 2.0f : 1.1f;
+		// One fat cylinder filling the footprint, centered over the whole building. 2.85 ≈ 2 cells
+		// across so a 2x2 tower reads the SAME SIZE as a 2x2 wall and a big Kodo; scales with the
+		// footprint extent (1.1 per cell over the 1.1 single-cell base) for any larger footprint.
+		const int32 Fp = Preset ? Preset->FootprintSize : 1;
+		const float Width = Fp > 1 ? (2.85f * 0.5f * Fp) : 1.1f;
 		Scale = FVector(Width, Width, 3.4f * GrowAlpha);
 		Location = BuildingCenter(Cell, State.StructureId);
 	}
